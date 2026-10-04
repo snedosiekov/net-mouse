@@ -3,7 +3,7 @@
 ; Build:  cmake --build build --config Release --target installer
 ;   or:   ISCC /DAppVersion=0.1.0 /DBinDir=..\build\Release installer\net-mouse.iss
 ;
-; Silent install: net-mouse-setup-<ver>.exe /VERYSILENT /ROLE=master|slave [/TASKS="autostart"]
+; Silent install: net-mouse-setup-<ver>.exe /VERYSILENT /ROLE=master|slave  (autostart is on; add /MERGETASKS="!autostart" to skip it)
 
 #ifndef AppVersion
   #define AppVersion "0.1.0"
@@ -40,7 +40,8 @@ VersionInfoProductName={#AppName}
 CloseApplications=no
 
 [Tasks]
-Name: "autostart"; Description: "Start {#AppName} automatically when a user logs on (with highest privileges, so a slave can also control administrator windows)"
+; Checked by default. Upgrades keep the previous choice; silent installs can opt out with /MERGETASKS="!autostart".
+Name: "autostart"; Description: "Start {#AppName} on Windows startup (when a user signs in)"; GroupDescription: "Startup:"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]

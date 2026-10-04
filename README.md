@@ -35,16 +35,19 @@ The setup:
 * asks for the role of the PC: master, slave, or ask on first start. The role becomes
   `--default-role`, so a role changed later from the tray menu is kept;
 * adds a Windows Firewall rule for the program;
-* optionally registers the scheduled task **Net Mouse**. It starts the app at logon for any user, with
-  highest privileges, so a slave can also control administrator windows;
+* **Start on Windows startup** (checked by default): registers the scheduled task **Net Mouse**. It
+  starts the app minimized to the tray when any user signs in, with highest privileges, so a slave can
+  also control administrator windows. Upgrades keep the previous choice;
 * on upgrade or uninstall asks running instances to quit (`net-mouse.exe --quit`, which restores the
   cursor), then removes the task and the firewall rule. Per-user settings in `%APPDATA%\NetMouse` are kept.
 
 Unattended install, e.g. for a slave deployed over SSH:
 
 ```
-net-mouse-setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /ROLE=slave /TASKS=autostart
+net-mouse-setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /ROLE=slave
 ```
+
+Startup is enabled by default; add `/MERGETASKS="!autostart"` to install without it.
 
 ## Usage
 
