@@ -3,13 +3,15 @@ Description=Net Mouse - share one mouse between PCs
 Documentation=https://github.com/snedosiekov/net-mouse
 After=network-online.target systemd-udev-settle.service
 Wants=network-online.target
+# Never give up restarting (e.g. the network is not up yet at boot).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStartPre=-/sbin/modprobe uinput
 ExecStart=/usr/local/bin/net-mouse-daemon --config /etc/net-mouse/netmouse.ini
-Restart=on-failure
-RestartSec=2
+Restart=always
+RestartSec=3
 
 # Needs root for /dev/uinput and exclusive access to /dev/input/event*; everything else is locked down.
 NoNewPrivileges=yes

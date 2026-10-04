@@ -63,7 +63,15 @@ echo uinput > /etc/modules-load.d/net-mouse.conf
 modprobe uinput
 firewall allow
 systemctl daemon-reload
-systemctl enable --now net-mouse.service
+# Start now and on every boot; restart picks up a new binary/settings when reinstalling.
+systemctl enable net-mouse.service
+systemctl restart net-mouse.service
+sleep 2
+if ! systemctl is-active --quiet net-mouse.service; then
+  journalctl -u net-mouse.service -n 30 --no-pager || true
+  die "net-mouse.service failed to start (log above)"
+fi
+echo "net-mouse.service: $(systemctl is-enabled net-mouse.service), $(systemctl is-active net-mouse.service)"
 
 echo
 echo "Installed as $ROLE. Detected hardware:"
