@@ -1,0 +1,26 @@
+[Unit]
+Description=Net Mouse - share one mouse between PCs
+Documentation=https://github.com/snedosiekov/net-mouse
+After=network-online.target systemd-udev-settle.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe uinput
+ExecStart=/usr/local/bin/net-mouse-daemon --config /etc/net-mouse/netmouse.ini
+Restart=on-failure
+RestartSec=2
+
+# Needs root for /dev/uinput and exclusive access to /dev/input/event*; everything else is locked down.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/net-mouse
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
