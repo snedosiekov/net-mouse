@@ -1,0 +1,17 @@
+# Runs at the end of 'make install': sets the role and enables/starts the service.
+# Role: ROLE=master|slave at install time (make install ROLE=slave), else -DNETMOUSE_ROLE=..., else
+# whatever is already configured.
+set(role "$ENV{ROLE}")
+if(role STREQUAL "")
+  set(role "@NETMOUSE_ROLE@")
+endif()
+
+if(NOT "$ENV{DESTDIR}" STREQUAL "")
+  message(STATUS "DESTDIR is set (packaging): skipping service setup")
+  return()
+endif()
+
+execute_process(COMMAND "@CMAKE_INSTALL_FULL_BINDIR@/net-mouse-ctl" setup ${role} RESULT_VARIABLE rc)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "net-mouse-ctl setup failed")
+endif()

@@ -164,21 +164,52 @@ same on X11, any Wayland compositor (GNOME, KDE, sway, Hyprland, ...) and the te
 * The **monitor layout** comes from `monitors=` in the settings (recommended), or is detected from the
   DRM connectors in `/sys/class/drm` (preferred mode, placed left to right).
 
-Build and install (needs `cmake` 3.20+ and `g++` 10+; no other dependencies):
+### Install from source
+
+Needs `cmake` 3.20+, `g++` 10+ (C++20) and the kernel headers; the settings window also needs
+`python3-tk`. On Debian/Ubuntu: `sudo apt install cmake g++ python3-tk`.
 
 ```
-sudo packaging/linux/install.sh slave                       # or: master
-sudo packaging/linux/install.sh slave --monitors 2560x1440+0+0,1920x1080+2560+0
-journalctl -u net-mouse -f                                  # logs
-sudo net-mouse-daemon --list-devices                        # detected monitors and mice
-sudo packaging/linux/install.sh --uninstall
+git clone https://github.com/snedosiekov/net-mouse.git
+cd net-mouse && mkdir build && cd build
+cmake ..
+make
+sudo make install ROLE=slave          # or ROLE=master
 ```
 
-The script builds into `build-linux/`, installs `/usr/local/bin/net-mouse-daemon`, writes
-`/etc/net-mouse/netmouse.ini`, loads `uinput`, opens UDP 47800 in ufw/firewalld and enables
-`net-mouse.service`.
+`make install` puts `net-mouse-daemon`, `net-mouse-ctl` and `net-mouse-gui` in `/usr/local/bin`,
+installs `net-mouse.service` and a desktop entry, loads `uinput` (now and at boot), opens UDP 47800 in
+ufw/firewalld, writes the role to `/etc/net-mouse/netmouse.ini`, and **enables and starts the
+service**. It then runs at every boot and is restarted if it ever stops. Without `ROLE=` the role
+stays as configured. On a first install the service then waits for `net-mouse-ctl role ...`.
+`sudo make uninstall` stops and disables the service and removes the installed files (settings are kept).
 
-Settings (`/etc/net-mouse/netmouse.ini`), in addition to the common ones:
+### Command line: `net-mouse-ctl`
+
+```
+net-mouse-ctl role                   # show the role
+sudo net-mouse-ctl role master       # change it (restarts the service)
+net-mouse-ctl monitors               # configured and detected layout
+sudo net-mouse-ctl monitors 2560x1440+0+0,1920x1080+2560+0     # or: auto
+net-mouse-ctl status                 # service state + what the daemon sees (JSON)
+net-mouse-ctl logs                   # follow the journal
+net-mouse-ctl gui                    # settings window
+```
+
+### Settings window: `net-mouse-gui`
+
+Start it from the application menu (*Net Mouse*) or with `net-mouse-gui`. It talks to the service over
+`/run/net-mouse/control.sock`:
+
+* **master:** the same arrangement editor as on Windows. Drag the green slave screens next to the
+  master's monitors; edges snap together, and the pointer crosses where screens touch.
+* **This PC:** the monitor layout (*Detect* reads it from `xrandr`, *Auto* uses the DRM detection) and the role.
+
+Anyone can view the status. Changes need root or membership in `sudo`, `wheel`, `admin` or `netmouse`.
+
+### Settings (`/etc/net-mouse/netmouse.ini`)
+
+In addition to the common ones:
 
 | Key | Default | |
 |---|---|---|
@@ -186,12 +217,11 @@ Settings (`/etc/net-mouse/netmouse.ini`), in addition to the common ones:
 | `pointer_speed` | `1.0` | master: speed multiplier for local movement |
 | `pointer_accel` | `0.0` | master: simple speed-dependent acceleration (0 = flat) |
 
-There is no tray UI on Linux yet. A Linux master places new slaves to its right; to move one, edit
-`slave.<id>.x/.y` in the settings and restart the service.
+Diagnostics: `sudo net-mouse-daemon --list-devices` shows the detected monitors and mice.
 
-Testing without hardware: `sudo python3 tests/linux_e2e.py build-linux/net-mouse-daemon` creates a
-fake mouse with uinput, runs a master and a slave on a private port, and checks edge crossing,
-clicks, wheel and the return to the master.
+Testing without hardware: `sudo python3 tests/linux_e2e.py build/net-mouse-daemon` creates a fake
+mouse with uinput and runs a master and a slave on a private port. It checks edge crossing, clicks,
+wheel, the return to the master and the control socket.
 
 Prototype limitations:
 
@@ -201,7 +231,8 @@ Prototype limitations:
   `pointer_speed` / `pointer_accel`.
 * **Multi-monitor slaves with mixed scaling:** how the compositor maps the absolute device can differ
   between compositors. Check that the pointer lands correctly at the edges.
-* Displays are read at start-up; restart the service after changing the monitor layout.
+* Displays are read at start-up. Changing them with `net-mouse-ctl monitors` or the settings window restarts
+  the service automatically.
 
 ## Source layout
 
@@ -213,8 +244,8 @@ Prototype limitations:
 | `src/platform/win/` | Windows: monitor enumeration, LL hook, `SendInput`, cursor hiding |
 | `src/ui/win/` | Windows UI: role dialog, tray icon, status window, display-arrangement editor |
 | `src/platform/linux/` | Linux: uinput virtual pointer, evdev capture, DRM/config monitor layout |
-| `src/linux/` | Linux service entry point (`net-mouse-daemon`) |
-| `installer/`, `packaging/linux/` | Inno Setup script; systemd unit and install script |
+| `src/linux/` | Linux service (`net-mouse-daemon`), control socket, settings window (`gui/net-mouse-gui.py`) |
+| `installer/`, `packaging/linux/`, `cmake/` | Inno Setup script; systemd unit, `net-mouse-ctl`, desktop entry, install/uninstall hooks |
 | `tests/` | protocol/layout/config tests, a full master↔slave session over fake platform objects, Linux end-to-end test |
 
 ## Limitations
@@ -231,7 +262,6 @@ Prototype limitations:
 
 ## Roadmap
 
-* **Linux, next steps:** a session helper (tray icon, arrangement editor) that also reports the exact
-  monitor layout from Wayland (`wl_output` / `xdg-output`) or X11 (XRandR) to the service over D-Bus;
-  touchpad support on the master; .deb/.rpm packages.
+* **Linux, next steps:** a tray icon; reading the monitor layout from Wayland (`wl_output` /
+  `xdg-output`) automatically; touchpad support on the master; .deb/.rpm packages.
 * Keyboard sharing, clipboard sharing, optional encryption and authentication of the protocol.

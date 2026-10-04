@@ -37,13 +37,33 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Service for both roles: evdev capture + uinput injection, independent of X11/Wayland.
+  #   mkdir build && cd build && cmake .. && make && sudo make install ROLE=master|slave
+  include(GNUInstallDirs)
+  set(NETMOUSE_ROLE "" CACHE STRING "Role applied by 'make install' (master or slave); ROLE=... at install time overrides it")
+  set(NETMOUSE_SYSTEMD_UNITDIR "/etc/systemd/system" CACHE PATH "Directory for net-mouse.service")
+
   add_executable(net-mouse-daemon
     src/platform/linux/uinput_device.cpp
     src/platform/linux/linux_platform.cpp
+    src/linux/control.cpp
     src/linux/main_linux.cpp
   )
   target_link_libraries(net-mouse-daemon PRIVATE nm_core)
-  install(TARGETS net-mouse-daemon RUNTIME DESTINATION bin)
+
+  configure_file(packaging/linux/net-mouse.service.in ${CMAKE_CURRENT_BINARY_DIR}/net-mouse.service @ONLY)
+  configure_file(packaging/linux/net-mouse-ctl.in ${CMAKE_CURRENT_BINARY_DIR}/net-mouse-ctl @ONLY)
+  configure_file(cmake/postinstall.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/postinstall.cmake @ONLY)
+  configure_file(cmake/uninstall.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake @ONLY)
+
+  install(TARGETS net-mouse-daemon RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/net-mouse-ctl DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(PROGRAMS src/linux/gui/net-mouse-gui.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME net-mouse-gui)
+  install(FILES packaging/linux/net-mouse.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/net-mouse.service DESTINATION ${NETMOUSE_SYSTEMD_UNITDIR})
+  install(SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/postinstall.cmake)  # role, uinput, firewall, enable + start
+
+  add_custom_target(uninstall COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake
+                    COMMENT "Stopping net-mouse.service and removing installed files")
 endif()
 
 if(WIN32)

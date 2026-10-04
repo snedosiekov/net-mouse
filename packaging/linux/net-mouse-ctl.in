@@ -1,0 +1,146 @@
+#!/bin/sh
+# net-mouse-ctl: manage the Net Mouse service on Linux.
+#
+#   net-mouse-ctl role [master|slave]    show or change the role (restarts the service)
+#   net-mouse-ctl monitors [SPEC|auto]   show or set this PC's monitor layout, e.g. 1920x1080+0+0,2560x1440+1920+0
+#   net-mouse-ctl status                 service state and what the daemon sees
+#   net-mouse-ctl logs                   follow the service log
+#   net-mouse-ctl gui                    open the settings window (screen arrangement)
+#   net-mouse-ctl setup [ROLE]           used by 'make install': uinput, firewall, enable + start
+#   net-mouse-ctl remove                 used by 'make uninstall': stop + disable, firewall
+set -eu
+
+DAEMON="@CMAKE_INSTALL_FULL_BINDIR@/net-mouse-daemon"
+GUI="@CMAKE_INSTALL_FULL_BINDIR@/net-mouse-gui"
+CONFIG_DIR=/etc/net-mouse
+CONFIG="$CONFIG_DIR/netmouse.ini"
+SERVICE=net-mouse.service
+PORT=47800
+
+die() { echo "net-mouse-ctl: $*" >&2; exit 1; }
+
+as_root() {  # re-run this command with sudo when needed
+  [ "$(id -u)" -eq 0 ] && return 0
+  command -v sudo >/dev/null 2>&1 || die "run as root"
+  exec sudo "$0" "$@"
+}
+
+get_key() { sed -n "s/^$1=//p" "$CONFIG" 2>/dev/null | tail -n 1; }
+
+set_key() {  # set_key KEY VALUE (empty VALUE removes the key)
+  mkdir -p "$CONFIG_DIR"
+  touch "$CONFIG"
+  sed -i "/^$1=/d" "$CONFIG"
+  [ -z "$2" ] || echo "$1=$2" >> "$CONFIG"
+}
+
+firewall() {  # firewall allow|remove
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if [ "$1" = allow ]; then ufw allow "$PORT/udp" comment net-mouse >/dev/null; else ufw delete allow "$PORT/udp" >/dev/null 2>&1 || true; fi
+    echo "ufw: UDP $PORT rule $1"
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if [ "$1" = allow ]; then firewall-cmd -q --permanent --add-port="$PORT/udp"; else firewall-cmd -q --permanent --remove-port="$PORT/udp" || true; fi
+    firewall-cmd -q --reload
+    echo "firewalld: UDP $PORT rule $1"
+  fi
+}
+
+start_service() {  # enable at boot, (re)start now and verify
+  systemctl enable -q "$SERVICE"
+  systemctl restart "$SERVICE"
+  sleep 2
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    journalctl -u "$SERVICE" -n 30 --no-pager || true
+    die "$SERVICE failed to start (log above)"
+  fi
+  echo "$SERVICE: $(systemctl is-enabled "$SERVICE"), $(systemctl is-active "$SERVICE") as $(get_key role)"
+}
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  role)
+    if [ $# -eq 0 ]; then
+      role=$(get_key role)
+      echo "${role:-not set}"
+      exit 0
+    fi
+    [ "$1" = master ] || [ "$1" = slave ] || die "usage: net-mouse-ctl role master|slave"
+    as_root role "$@"
+    systemctl stop "$SERVICE" 2>/dev/null || true
+    set_key role "$1"
+    start_service
+    ;;
+
+  monitors)
+    if [ $# -eq 0 ]; then
+      spec=$(get_key monitors)
+      echo "configured: ${spec:-auto (detected from DRM)}"
+      "$DAEMON" --config "$CONFIG" --list-devices | sed -n '/^Monitors:/,/^Input/p' | sed '$d'
+      exit 0
+    fi
+    as_root monitors "$@"
+    if [ "$1" = auto ]; then spec=""; else spec=$1; fi
+    systemctl stop "$SERVICE" 2>/dev/null || true
+    set_key monitors "$spec"
+    if [ -n "$(get_key role)" ]; then start_service; fi
+    ;;
+
+  status)
+    echo "service:  $(systemctl is-enabled "$SERVICE" 2>/dev/null || echo not-installed), $(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    echo "role:     $(get_key role)"
+    echo "monitors: $(get_key monitors)"
+    if reply=$("$DAEMON" --query status 2>/dev/null); then
+      if command -v python3 >/dev/null 2>&1; then
+        echo "$reply" | python3 -m json.tool
+      else
+        echo "$reply"
+      fi
+    fi
+    ;;
+
+  logs)
+    exec journalctl -u "$SERVICE" -f
+    ;;
+
+  gui)
+    exec "$GUI" "$@"
+    ;;
+
+  setup)
+    as_root setup "$@"
+    modprobe uinput || die "cannot load the uinput kernel module"
+    echo uinput > /etc/modules-load.d/net-mouse.conf
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG"
+    if [ $# -gt 0 ] && [ -n "$1" ]; then
+      [ "$1" = master ] || [ "$1" = slave ] || die "role must be master or slave"
+      set_key role "$1"
+    fi
+    firewall allow
+    systemctl daemon-reload
+    if [ -n "$(get_key role)" ]; then
+      start_service
+    else
+      systemctl enable -q "$SERVICE"
+      echo "Installed. No role yet: run 'sudo net-mouse-ctl role master' (or slave) to start the service."
+    fi
+    ;;
+
+  remove)
+    as_root remove "$@"
+    systemctl disable --now -q "$SERVICE" 2>/dev/null || true
+    rm -f /etc/modules-load.d/net-mouse.conf
+    firewall remove
+    echo "Service stopped and disabled. Settings kept in $CONFIG_DIR."
+    ;;
+
+  -h|--help|help)
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+
+  *)
+    die "unknown command '$cmd' (role, monitors, status, logs, gui, setup, remove)"
+    ;;
+esac

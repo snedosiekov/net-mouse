@@ -9,6 +9,7 @@ slave's virtual pointer emitted.
 """
 
 import fcntl
+import json
 import os
 import re
 import struct
@@ -95,6 +96,7 @@ def wait_for(predicate, timeout=10.0):
 def main():
     daemon = sys.argv[1] if len(sys.argv) > 1 else "build-linux/net-mouse-daemon"
     tmp = tempfile.mkdtemp(prefix="nm-e2e-")
+    os.chmod(tmp, 0o755)  # the unprivileged-client check connects as "nobody"
     for role in ("master", "slave"):
         with open(f"{tmp}/{role}.ini", "w") as f:
             f.write(f"role={role}\nport={PORT}\nmonitors=1920x1080+0+0\nname=e2e-{role}\n")
@@ -109,7 +111,8 @@ def main():
     mouse = FakeMouse()
     time.sleep(0.3)
     logs = {r: open(f"{tmp}/{r}.log", "w+") for r in ("master", "slave")}
-    procs = {r: subprocess.Popen([daemon, "--config", f"{tmp}/{r}.ini"], stdout=logs[r], stderr=subprocess.STDOUT)
+    procs = {r: subprocess.Popen([daemon, "--config", f"{tmp}/{r}.ini", "--control", f"{tmp}/{r}.sock"],
+                                 stdout=logs[r], stderr=subprocess.STDOUT)
              for r in ("slave", "master")}
     try:
         log = lambda r: open(f"{tmp}/{r}.log").read()
@@ -166,6 +169,26 @@ def main():
         ev = master_ptr.drain()
         xs = [v for t, c, v in ev if t == EV_ABS and c == ABS_X]
         check(bool(xs) and xs[-1] == 1720, f"pointer returned to the master (last x={xs[-1] if xs else None})")
+
+        # Control socket (used by net-mouse-gui / net-mouse-ctl).
+        query = lambda r, req: subprocess.run([daemon, "--control", f"{tmp}/{r}.sock", "--query", req],
+                                              capture_output=True, text=True).stdout.strip()
+        status = json.loads(query("master", "status"))
+        slaves = status.get("slaves", [])
+        check(status.get("role") == "master" and len(slaves) == 1 and slaves[0]["online"],
+              "control socket: master status lists the online slave")
+        check(query("master", f"set-offset {slaves[0]['id']} 0 0").startswith("error"),
+              "control socket: overlapping position is refused")
+        check(query("master", f"set-offset {slaves[0]['id']} -1920 0") == "ok",
+              "control socket: slave moved to the left of the master")
+        check(wait_for(lambda: "desktop origin at (-1920, 0)" in log("slave")), "slave received the new position")
+        check(json.loads(query("slave", "status")).get("offset") == {"x": -1920, "y": 0},
+              "control socket: slave status shows the new origin")
+        unprivileged = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", daemon,
+                                       "--control", f"{tmp}/master.sock", "--query",
+                                       f"set-offset {slaves[0]['id']} 1920 0"], capture_output=True, text=True)
+        check("permission denied" in unprivileged.stdout,
+              f"control socket: changes refused for unprivileged users ({(unprivileged.stdout + unprivileged.stderr).strip()})")
     finally:
         for p in procs.values():
             p.terminate()

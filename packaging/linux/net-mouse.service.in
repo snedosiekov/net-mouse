@@ -9,9 +9,13 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStartPre=-/sbin/modprobe uinput
-ExecStart=/usr/local/bin/net-mouse-daemon --config /etc/net-mouse/netmouse.ini
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/net-mouse-daemon --config /etc/net-mouse/netmouse.ini
+# Also used to apply role/monitor changes: the daemon exits and is started again.
 Restart=always
-RestartSec=3
+RestartSec=2
+# Control socket for net-mouse-gui and net-mouse-ctl: /run/net-mouse/control.sock
+RuntimeDirectory=net-mouse
+RuntimeDirectoryMode=0755
 
 # Needs root for /dev/uinput and exclusive access to /dev/input/event*; everything else is locked down.
 NoNewPrivileges=yes

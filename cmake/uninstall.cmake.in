@@ -1,0 +1,18 @@
+# 'make uninstall': stops the service and removes every file listed in install_manifest.txt.
+set(manifest "@CMAKE_CURRENT_BINARY_DIR@/install_manifest.txt")
+if(NOT EXISTS "${manifest}")
+  message(FATAL_ERROR "${manifest} not found: nothing was installed from this build directory")
+endif()
+
+if(EXISTS "@CMAKE_INSTALL_FULL_BINDIR@/net-mouse-ctl")
+  execute_process(COMMAND "@CMAKE_INSTALL_FULL_BINDIR@/net-mouse-ctl" remove)
+endif()
+
+file(STRINGS "${manifest}" files)
+foreach(f IN LISTS files)
+  if(EXISTS "$ENV{DESTDIR}${f}" OR IS_SYMLINK "$ENV{DESTDIR}${f}")
+    message(STATUS "Removing ${f}")
+    file(REMOVE "$ENV{DESTDIR}${f}")
+  endif()
+endforeach()
+execute_process(COMMAND systemctl daemon-reload)

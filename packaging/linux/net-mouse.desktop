@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Net Mouse
+Comment=Share one mouse between PCs: arrange slave screens, monitors and role
+Exec=net-mouse-gui
+Icon=input-mouse
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=mouse;kvm;share;network;
