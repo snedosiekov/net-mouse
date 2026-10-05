@@ -97,6 +97,7 @@ struct App {
   bool trayActive = false;
   std::wstring trayTip;
   bool showTrayHint = false;
+  bool closeHintShown = false;  // "still running" balloon after the first window close
   uint64_t menuSlave = 0;  // slave the canvas context menu is about  // first run: tell the user where the app went
 };
 
@@ -338,7 +339,7 @@ void updateTrayIcon() {
   Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-void showTrayHint() {
+void showTrayBalloon(const wchar_t* title, const wchar_t* text) {
   NOTIFYICONDATAW nid{};
   nid.cbSize = sizeof(nid);
   nid.hWnd = g.hwnd;
@@ -346,12 +347,15 @@ void showTrayHint() {
   nid.uFlags = NIF_INFO;
   nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
   nid.hBalloonIcon = g.iconIdle;
-  wcsncpy_s(nid.szInfoTitle, L"Net Mouse is running", _TRUNCATE);
-  wcsncpy_s(nid.szInfo,
-            g.master ? L"It runs in the notification area. Click the mouse icon to arrange the slave screens."
-                     : L"It runs in the notification area. Click the mouse icon to see the status.",
-            _TRUNCATE);
+  wcsncpy_s(nid.szInfoTitle, title, _TRUNCATE);
+  wcsncpy_s(nid.szInfo, text, _TRUNCATE);
   Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+void showTrayHint() {
+  showTrayBalloon(L"Net Mouse is running",
+                  g.master ? L"It runs in the notification area. Click the mouse icon to arrange the slave screens."
+                           : L"It runs in the notification area. Click the mouse icon to see the status.");
 }
 
 void removeTrayIcon() {
@@ -369,7 +373,7 @@ void showTrayMenu() {
   if (g.slave && g.slave->snapshot().paired) AppendMenuW(menu, MF_STRING, IDM_FORGET_MASTER, L"Forget master…");
   AppendMenuW(menu, MF_STRING, IDM_CHANGE_ROLE, L"Change role…");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
+  AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Close Net Mouse");
   SetMenuDefaultItem(menu, IDM_SHOW, FALSE);
   POINT pt;
   GetCursorPos(&pt);
@@ -606,7 +610,15 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       if (wParam) DestroyWindow(hwnd);  // logoff/shutdown or an installer closing the app
       return 0;
     case WM_CLOSE:
-      ShowWindow(hwnd, SW_HIDE);  // keep running in the tray
+      // The window's close button only hides it (like minimize); the app keeps working in the tray
+      // and is closed from the tray icon's menu.
+      ShowWindow(hwnd, SW_HIDE);
+      if (!g.closeHintShown) {
+        g.closeHintShown = true;
+        showTrayBalloon(L"Net Mouse is still running",
+                        L"To close it, right-click the mouse icon in the notification area and choose "
+                        L"“Close Net Mouse”.");
+      }
       return 0;
     case WM_DESTROY:
       KillTimer(hwnd, kRefreshTimer);
