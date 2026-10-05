@@ -41,8 +41,10 @@ class UdpMulticast : public ITransport {
   int receive(uint8_t* buffer, size_t capacity, uint32_t& sourceIp, int timeoutMs);
 
   void send(const std::vector<uint8_t>& datagram, uint32_t peerIp) override;
+  bool isLocalSubnet(uint32_t ip) const override;
 
  private:
+  bool isLocalSubnetLocked(uint32_t ip) const;
   void setOutgoingLocked(uint32_t ifaceAddr);
   void sendToGroupLocked(const std::vector<uint8_t>& datagram);
 
@@ -52,7 +54,7 @@ class UdpMulticast : public ITransport {
   uint32_t fixedIface_ = 0;
   bool wsaStarted_ = false;
 
-  std::mutex mutex_;  // guards everything below plus the socket's outgoing interface option
+  mutable std::mutex mutex_;  // guards everything below plus the socket's outgoing interface option
   std::vector<NetInterface> interfaces_;
   std::set<uint32_t> joined_;
   uint32_t currentOutgoing_ = 0xFFFFFFFFu;

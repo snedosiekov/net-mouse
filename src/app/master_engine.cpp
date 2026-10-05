@@ -215,7 +215,8 @@ void MasterEngine::handleHelloLocked(const proto::SlaveHello& hello, uint64_t se
     s = &slaves_.back();
   }
   s->name = hello.name;
-  s->ip = ip;
+  // A multi-homed slave announces itself from every interface: keep an address we can reach.
+  if (s->ip == 0 || ip == s->ip || transport_.isLocalSubnet(ip) || !transport_.isLocalSubnet(s->ip)) s->ip = ip;
   s->lastSeenMs = nowMs;
   if (s->monitors != hello.monitors) {
     s->monitors = hello.monitors;

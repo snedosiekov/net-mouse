@@ -256,6 +256,18 @@ void UdpMulticast::sendToGroupLocked(const std::vector<uint8_t>& datagram) {
          reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
 
+bool UdpMulticast::isLocalSubnetLocked(uint32_t ip) const {
+  for (const NetInterface& ni : interfaces_) {
+    if (ni.mask && (ni.addr & ni.mask) == (ip & ni.mask)) return true;
+  }
+  return false;
+}
+
+bool UdpMulticast::isLocalSubnet(uint32_t ip) const {
+  std::lock_guard lock(mutex_);
+  return isLocalSubnetLocked(ip);
+}
+
 void UdpMulticast::send(const std::vector<uint8_t>& datagram, uint32_t peerIp) {
   if (sock_ == -1) return;
   std::lock_guard lock(mutex_);
@@ -263,6 +275,9 @@ void UdpMulticast::send(const std::vector<uint8_t>& datagram, uint32_t peerIp) {
     setOutgoingLocked(fixedIface_);
     sendToGroupLocked(datagram);
     return;
+  }
+  if (peerIp != kRouteDefault && peerIp != kRouteAllInterfaces && !isLocalSubnetLocked(peerIp)) {
+    peerIp = kRouteAllInterfaces;  // not on any of our subnets: the right interface is unknown
   }
   if (peerIp == kRouteAllInterfaces) {
     if (interfaces_.empty()) {

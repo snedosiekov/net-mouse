@@ -211,6 +211,39 @@ void testSession() {
   std::filesystem::remove(dir / "nm_test_slave.ini");
 }
 
+// A slave with two network cards announces itself from both; the master must keep the address that
+// is on one of its own subnets.
+void testMultiHomedSlave() {
+  struct SubnetTransport : FakeTransport {
+    bool isLocalSubnet(uint32_t ip) const override { return (ip >> 24) == 10; }
+  };
+  Config cfg;
+  cfg.load(std::filesystem::temp_directory_path() / "nm_test_multihomed.ini");
+  SubnetTransport net;
+  FakeDisplays displays;
+  displays.list = {{{0, 0, 1920, 1080}, true, "M1"}};
+  FakeCursor cursor;
+  MasterEngine master({1, "master", true}, cfg, net, displays, cursor);
+
+  proto::Packet hello;
+  hello.sender = 7;
+  hello.body = proto::SlaveHello{"kie", {{0, 0, 1920, 1080}}, 0, 0};
+  const uint32_t reachable = 0x0A0A4597;    // 10.10.69.151
+  const uint32_t unreachable = 0xC0A80D03;  // 192.168.13.3
+  master.onPacket(hello, reachable, 1000);
+  master.onPacket(hello, unreachable, 1001);
+  CHECK(master.snapshot().slaves[0].ip == reachable);
+  master.onPacket(hello, reachable, 1002);
+  CHECK(master.snapshot().slaves[0].ip == reachable);
+
+  // First seen only on an unreachable address, later on a reachable one: switch to it.
+  hello.sender = 8;
+  master.onPacket(hello, unreachable, 1003);
+  master.onPacket(hello, reachable, 1004);
+  CHECK(master.snapshot().slaves[1].ip == reachable);
+  std::filesystem::remove(std::filesystem::temp_directory_path() / "nm_test_multihomed.ini");
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +251,7 @@ int main() {
   testLayout();
   testConfig();
   testSession();
+  testMultiHomedSlave();
   if (g_failures == 0) std::printf("All tests passed\n");
   return g_failures == 0 ? 0 : 1;
 }
