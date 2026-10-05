@@ -38,6 +38,7 @@ struct SlaveHello {
   std::vector<Rect> monitors;  // the slave's own desktop coordinates (physical pixels)
   uint64_t masterId = 0;       // master whose configuration is applied (0 = none)
   uint32_t configVersion = 0;  // version of that configuration
+  uint32_t address = 0;        // slave's main IPv4 (the one on its default route), 0 = unknown
 };
 
 // Master -> slave: where the slave's desktop sits in the master's layout space.

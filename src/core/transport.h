@@ -19,6 +19,8 @@ class ITransport {
   // True if ip lies in the subnet of one of our interfaces (multi-homed peers announce themselves
   // from every interface; this tells which of their addresses we can actually reach).
   virtual bool isLocalSubnet(uint32_t /*ip*/) const { return true; }
+  // This host's main IPv4 address (the one on its default route), 0 if unknown.
+  virtual uint32_t primaryAddress() const { return 0; }
 };
 
 }  // namespace nm

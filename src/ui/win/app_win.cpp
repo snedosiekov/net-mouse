@@ -535,8 +535,8 @@ bool createWindow(HINSTANCE instance) {
 
   g.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
   const UINT dpi = GetDpiForSystem();
-  const int w = MulDiv(g.master ? 900 : 640, static_cast<int>(dpi), 96);
-  const int h = MulDiv(g.master ? 680 : 360, static_cast<int>(dpi), 96);
+  const int w = MulDiv(g.master ? 1040 : 640, static_cast<int>(dpi), 96);
+  const int h = MulDiv(g.master ? 760 : 360, static_cast<int>(dpi), 96);
   const std::wstring title = std::format(L"{} – {} ({})", kAppTitle, g.master ? L"Master" : L"Slave", widen(g.name));
   return CreateWindowExW(0, className.c_str(), title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h,
                          nullptr, nullptr, instance, nullptr) != nullptr;

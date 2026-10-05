@@ -187,8 +187,11 @@ void UdpMulticast::close() {
 void UdpMulticast::refreshInterfaces() {
   if (sock_ == -1) return;
   std::vector<NetInterface> found = listInterfaces();
+  const uint32_t primary = defaultRouteAddress();
   std::lock_guard lock(mutex_);
   interfaces_ = found;
+  // Prefer the default-route address; without one (isolated LAN) use the first interface.
+  primary_ = primary ? primary : (found.empty() ? 0 : found.front().addr);
   std::vector<uint32_t> wanted;
   if (fixedIface_) {
     wanted.push_back(fixedIface_);
@@ -254,6 +257,33 @@ void UdpMulticast::sendToGroupLocked(const std::vector<uint8_t>& datagram) {
   to.sin_addr = toInAddr(group_);
   sendto(handle(sock_), reinterpret_cast<const char*>(datagram.data()), static_cast<int>(datagram.size()), 0,
          reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+uint32_t defaultRouteAddress() {
+  // connect() on a UDP socket only selects the route; nothing is sent.
+  SocketHandle s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+#ifdef _WIN32
+  if (s == INVALID_SOCKET) return 0;
+#else
+  if (s < 0) return 0;
+#endif
+  sockaddr_in remote{};
+  remote.sin_family = AF_INET;
+  remote.sin_port = htons(53);
+  remote.sin_addr = toInAddr(0x08080808);  // any public address works
+  uint32_t result = 0;
+  if (connect(s, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) == 0) {
+    sockaddr_in local{};
+    SockLen len = sizeof(local);
+    if (getsockname(s, reinterpret_cast<sockaddr*>(&local), &len) == 0) result = ntohl(local.sin_addr.s_addr);
+  }
+  closeSocket(s);
+  return result;
+}
+
+uint32_t UdpMulticast::primaryAddress() const {
+  std::lock_guard lock(mutex_);
+  return primary_;
 }
 
 bool UdpMulticast::isLocalSubnetLocked(uint32_t ip) const {

@@ -158,6 +158,7 @@ void SlaveEngine::sendHelloLocked() {
   for (const MonitorInfo& m : monitors_) hello.monitors.push_back(m.rect);
   hello.masterId = masterId_;
   hello.configVersion = configVersion_;
+  hello.address = transport_.primaryAddress();
   proto::Packet p;
   p.sender = options_.id;
   p.body = std::move(hello);

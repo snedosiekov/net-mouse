@@ -17,18 +17,37 @@ import socket
 import subprocess
 import sys
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox
 
 SOCKET_PATH = os.environ.get("NETMOUSE_CONTROL", "/run/net-mouse/control.sock")
 POLL_MS = 400
 SNAP_PX = 12
 
-MASTER_FILL = "#3465a4"
-SLAVE_ONLINE_FILL = "#2e8b57"
-SLAVE_DRAG_FILL = "#5ab482"
-BORDER = "#1e1e1e"
+MASTER_COLORS = ("#447fdb", "#3a71cc")  # (upper, lower) half of a screen: a subtle sheen
+SLAVE_COLORS = ("#33a873", "#2b9866")
+SLAVE_DRAG_COLORS = ("#62cf97", "#55c18a")
+BEZEL = "#22262e"
+SHADOW = "#c9cfd9"
+GRID_DOT = "#d6dbe4"
 ACTIVE = "#ff8c00"
-CANVAS_BG = "#eceef2"
+CANVAS_BG = "#eef1f6"
+
+
+def round_rect(canvas, x0, y0, x1, y1, r, **kw):
+    """Rounded rectangle as a smoothed polygon."""
+    points = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+              x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+    return canvas.create_polygon(points, smooth=True, **kw)
+
+
+def elide(text, font, width):
+    """Shortens text with an ellipsis until it fits into width pixels."""
+    if font.measure(text) <= width:
+        return text
+    while text and font.measure(text + "…") > width:
+        text = text[:-1]
+    return text + "…" if text else ""
 
 
 class Client:
@@ -102,6 +121,9 @@ class App:
 
         self.header = tk.Label(root, anchor="w", font=("TkDefaultFont", 11, "bold"), padx=10, pady=6)
         self.header.pack(fill="x")
+        self.title_font = tkfont.nametofont("TkDefaultFont").copy()
+        self.title_font.configure(weight="bold", size=self.title_font.cget("size") + 1)
+        self.body_font = tkfont.nametofont("TkDefaultFont").copy()
         self.canvas = tk.Canvas(root, background=CANVAS_BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=10)
         self.info = tk.Label(root, anchor="w", justify="left", padx=10, pady=6)
@@ -236,7 +258,7 @@ class App:
         out = []
         for i, m in enumerate(s.get("monitors", [])):
             title = "MASTER" if s.get("role") == "master" else "THIS PC"
-            label = f"{title} {i + 1}{' (primary)' if m['primary'] else ''}\n{m['w']}×{m['h']}"
+            label = f"{title} {i + 1}\n{m['w']} × {m['h']}" + ("\nprimary" if m["primary"] else "")
             out.append(((m["x"], m["y"], m["w"], m["h"]), "master", None, label))
         for v in s.get("slaves", []):
             if not v["online"] and not (self.drag and self.drag["id"] == v["id"]):
@@ -244,7 +266,8 @@ class App:
             ox, oy = self.offset_of(v)
             for k, r in enumerate(v["monitors"]):
                 label = v["name"] + (f" #{k + 1}" if len(v["monitors"]) > 1 else "")
-                label += f"\n{r['w']}×{r['h']}" + ("" if v["synced"] else "\n(syncing…)")
+                label += f"\n{v['ip']}" if v.get("ip") else ""
+                label += f"\n{r['w']} × {r['h']}" + ("" if v["synced"] else "\nsyncing…")
                 out.append(((r["x"] + ox, r["y"] + oy, r["w"], r["h"]), "slave", v, label))
         return out
 
@@ -262,8 +285,9 @@ class App:
         top = min(r[1] for r in rects)
         right = max(r[0] + r[2] for r in rects)
         bottom = max(r[1] + r[3] for r in rects)
-        pad = max(right - left, bottom - top) * 0.35  # room to drag slaves to any side
-        self.scale = min(cw / (right - left + 2 * pad), ch / (bottom - top + 2 * pad))
+        margin = 36  # room for shadows and for dragging a slave past the outer edges
+        self.scale = min((cw - 2 * margin) / (right - left), (ch - 2 * margin) / (bottom - top))
+        self.scale = max(0.01, min(self.scale, 0.25))  # a single small screen should not fill the view
         self.origin = ((left + right) / 2 - cw / 2 / self.scale, (top + bottom) / 2 - ch / 2 / self.scale)
 
     def to_canvas(self, x, y):
@@ -276,24 +300,59 @@ class App:
         if not self.drag:
             self.compute_transform([r for r, _, _, _ in screens])
         s = self.status or {}
+        w_c, h_c = c.winfo_width(), c.winfo_height()
+        for gy in range(11, h_c, 22):  # faint dot grid
+            for gx in range(11, w_c, 22):
+                c.create_oval(gx - 1, gy - 1, gx + 1, gy + 1, fill=GRID_DOT, outline="")
         for (x, y, w, h), kind, v, label in screens:
             x0, y0 = self.to_canvas(x, y)
             x1, y1 = self.to_canvas(x + w, y + h)
             active = v is not None and s.get("remote") and s.get("active") == v["id"]
             if kind == "master":
-                fill = MASTER_FILL
+                colors = MASTER_COLORS
             else:
-                fill = SLAVE_DRAG_FILL if self.drag and self.drag["id"] == v["id"] else SLAVE_ONLINE_FILL
-            c.create_rectangle(x0, y0, x1, y1, fill=fill, outline=ACTIVE if active else BORDER,
-                               width=4 if active else 2)
-            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label, fill="white", justify="center",
-                          width=max(x1 - x0 - 8, 10))
+                colors = SLAVE_DRAG_COLORS if self.drag and self.drag["id"] == v["id"] else SLAVE_COLORS
+            self.draw_monitor(x0, y0, x1, y1, colors, active, label.split("\n"))
         if s.get("role") == "master" and s.get("remote"):
             px, py = self.to_canvas(s["pointer"]["x"], s["pointer"]["y"])
-            c.create_oval(px - 5, py - 5, px + 5, py + 5, fill=ACTIVE, outline=BORDER)
+            c.create_oval(px - 8, py - 8, px + 8, py + 8, fill="white", outline="")
+            c.create_oval(px - 6, py - 6, px + 6, py + 6, fill=ACTIVE, outline="")
         if s.get("role") == "master" and not s.get("slaves"):
             c.create_text(c.winfo_width() / 2, c.winfo_height() - 20, fill="#5a5a5a",
                           text="Waiting for slaves… Install Net Mouse on another PC and choose \"slave\".")
+
+    def draw_monitor(self, x0, y0, x1, y1, colors, active, lines):
+        """Shadow, dark bezel, two-tone 'screen' and text (name bold; lines that do not fit are dropped)."""
+        c = self.canvas
+        x0, y0, x1, y1 = x0 + 1.5, y0 + 1.5, x1 - 1.5, y1 - 1.5  # gap between touching monitors
+        if x1 - x0 < 6 or y1 - y0 < 6:
+            return
+        r = max(3.0, min(10.0, min(x1 - x0, y1 - y0) * 0.08))
+        round_rect(c, x0 + 1, y0 + 4, x1 + 2, y1 + 4, r, fill=SHADOW, outline="")
+        if active:
+            round_rect(c, x0 - 4, y0 - 4, x1 + 4, y1 + 4, r + 3, fill="", outline=ACTIVE, width=3)
+        round_rect(c, x0, y0, x1, y1, r, fill=BEZEL, outline="")
+        b = 3
+        light, dark = colors
+        round_rect(c, x0 + b, y0 + b, x1 - b, y1 - b, max(1.0, r - 2), fill=dark, outline="")
+        round_rect(c, x0 + b, y0 + b, x1 - b, y0 + b + (y1 - y0 - 2 * b) * 0.5, max(1.0, r - 2), fill=light,
+                   outline="")
+        c.create_rectangle(x0 + b, y0 + b + (y1 - y0 - 2 * b) * 0.25, x1 - b, y0 + b + (y1 - y0 - 2 * b) * 0.5,
+                           fill=light, outline="")
+        width = x1 - x0 - 2 * b - 6
+        heights = [self.title_font.metrics("linespace")] + [self.body_font.metrics("linespace")] * (len(lines) - 1)
+        count, needed = 0, 0
+        for h in heights:
+            if needed + h > y1 - y0 - 2 * b and count:
+                break
+            needed, count = needed + h, count + 1
+        y = (y0 + y1) / 2 - needed / 2
+        for i in range(count):
+            font = self.title_font if i == 0 else self.body_font
+            text = elide(lines[i], font, width)
+            c.create_text((x0 + x1) / 2, y + heights[i] / 2, text=text, font=font,
+                          fill="white" if i == 0 else "#e6f0f5")
+            y += heights[i]
 
     def on_press(self, event):
         if not self.status or self.status.get("role") != "master":

@@ -84,6 +84,15 @@ void testProtocol() {
   CHECK(ptr && ptr->target == 9 && ptr->pos.x == -5 && ptr->pos.y == 70000 && ptr->buttons == 0x11 &&
         ptr->wheelV == -120 && ptr->wheelH == 240);
 
+  // The hello's main address is an appended field: a hello from an older slave (without it) still decodes.
+  p.body = proto::SlaveHello{"pc-2", {{0, 0, 1920, 1080}}, 42, 7, 0x0A0A4597};
+  auto withAddress = proto::encode(p);
+  auto d2 = proto::decode(withAddress.data(), withAddress.size());
+  CHECK(d2 && std::get<proto::SlaveHello>(d2->body).address == 0x0A0A4597);
+  auto d3 = proto::decode(withAddress.data(), withAddress.size() - 4);
+  CHECK(d3 && std::get<proto::SlaveHello>(d3->body).address == 0 &&
+        std::get<proto::SlaveHello>(d3->body).monitors.size() == 1);
+
   // Truncated or foreign datagrams are rejected.
   CHECK(!proto::decode(bytes.data(), bytes.size() - 1));
   bytes[0] ^= 0xFF;
@@ -241,6 +250,16 @@ void testMultiHomedSlave() {
   master.onPacket(hello, unreachable, 1003);
   master.onPacket(hello, reachable, 1004);
   CHECK(master.snapshot().slaves[1].ip == reachable);
+
+  // Two reachable addresses: no flipping, and the slave's own main address wins when it reports one.
+  const uint32_t other = 0x0A0A0102;  // 10.10.1.2, also reachable
+  hello.sender = 9;
+  master.onPacket(hello, other, 1005);
+  master.onPacket(hello, reachable, 1006);
+  CHECK(master.snapshot().slaves[2].ip == other);
+  std::get<proto::SlaveHello>(hello.body).address = reachable;
+  master.onPacket(hello, other, 1007);
+  CHECK(master.snapshot().slaves[2].ip == reachable);
   std::filesystem::remove(std::filesystem::temp_directory_path() / "nm_test_multihomed.ini");
 }
 

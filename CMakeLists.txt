@@ -75,7 +75,7 @@ if(WIN32)
     src/ui/win/app_win.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/resources.rc
   )
-  target_link_libraries(net-mouse PRIVATE nm_core comctl32 shell32 user32 gdi32)
+  target_link_libraries(net-mouse PRIVATE nm_core comctl32 shell32 user32 gdi32 gdiplus)
 
   # Installer: cmake --build build --config Release --target installer
   find_program(ISCC_EXECUTABLE ISCC

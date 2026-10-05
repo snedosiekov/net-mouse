@@ -21,6 +21,8 @@ struct NetInterface {
 // Up, non-loopback IPv4 interfaces.
 std::vector<NetInterface> listInterfaces();
 std::string ipToString(uint32_t hostOrderIp);
+// Local address the OS would use for the default route (0 if there is none).
+uint32_t defaultRouteAddress();
 bool parseIp(const std::string& text, uint32_t& hostOrderIp);
 
 class UdpMulticast : public ITransport {
@@ -42,6 +44,7 @@ class UdpMulticast : public ITransport {
 
   void send(const std::vector<uint8_t>& datagram, uint32_t peerIp) override;
   bool isLocalSubnet(uint32_t ip) const override;
+  uint32_t primaryAddress() const override;
 
  private:
   bool isLocalSubnetLocked(uint32_t ip) const;
@@ -58,6 +61,7 @@ class UdpMulticast : public ITransport {
   std::vector<NetInterface> interfaces_;
   std::set<uint32_t> joined_;
   uint32_t currentOutgoing_ = 0xFFFFFFFFu;
+  uint32_t primary_ = 0;
 };
 
 }  // namespace nm

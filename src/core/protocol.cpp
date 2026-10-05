@@ -48,6 +48,8 @@ class Reader {
 
   bool ok() const { return ok_; }
 
+  size_t remaining() const { return ok_ ? size_ - pos_ : 0; }
+
   uint8_t u8() {
     if (!ok_ || pos_ >= size_) {
       ok_ = false;
@@ -125,6 +127,7 @@ std::vector<uint8_t> encode(const Packet& packet) {
           const size_t n = std::min(m.monitors.size(), kMaxMonitors);
           w.u8(static_cast<uint8_t>(n));
           for (size_t i = 0; i < n; ++i) w.rect(m.monitors[i]);
+          w.u32(m.address);  // appended field: older decoders ignore trailing bytes
         } else if constexpr (std::is_same_v<T, SlaveConfig>) {
           w.u64(m.target);
           w.u32(m.version);
@@ -165,6 +168,7 @@ std::optional<Packet> decode(const uint8_t* data, size_t size) {
       const size_t n = r.u8();
       if (n > kMaxMonitors) return std::nullopt;
       for (size_t i = 0; i < n && r.ok(); ++i) m.monitors.push_back(r.rect());
+      if (r.remaining() >= 4) m.address = r.u32();  // absent in hellos from older slaves
       p.body = std::move(m);
       break;
     }
