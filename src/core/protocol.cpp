@@ -6,6 +6,10 @@
 namespace nm::proto {
 namespace {
 
+constexpr size_t kHeaderSize = 4 + 1 + 1 + 8 + 4;                        // magic, version, type, sender, seq
+constexpr size_t kSealedAdSize = kHeaderSize + 8 + 1 + crypto::kNonceSize;  // + target, key kind, nonce
+constexpr uint8_t kSealedType = 7;
+
 class Writer {
  public:
   void u8(uint8_t v) { buf.push_back(v); }
@@ -23,6 +27,11 @@ class Writer {
   }
   void i16(int16_t v) { u16(static_cast<uint16_t>(v)); }
   void i32(int32_t v) { u32(static_cast<uint32_t>(v)); }
+  void bytes(const uint8_t* data, size_t size) { buf.insert(buf.end(), data, data + size); }
+  template <size_t N>
+  void bytes(const std::array<uint8_t, N>& a) {
+    bytes(a.data(), N);
+  }
   void str(const std::string& s) {
     const size_t n = std::min(s.size(), kMaxString);
     u8(static_cast<uint8_t>(n));
@@ -38,7 +47,13 @@ class Writer {
     i32(r.right);
     i32(r.bottom);
   }
-  void keys(const KeySet& k) { buf.insert(buf.end(), k.bits.begin(), k.bits.end()); }
+  void header(uint8_t type, uint64_t sender, uint32_t seq) {
+    u32(kMagic);
+    u8(kVersion);
+    u8(type);
+    u64(sender);
+    u32(seq);
+  }
 
   std::vector<uint8_t> buf;
 };
@@ -48,7 +63,6 @@ class Reader {
   Reader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
 
   bool ok() const { return ok_; }
-
   size_t remaining() const { return ok_ ? size_ - pos_ : 0; }
 
   uint8_t u8() {
@@ -75,6 +89,12 @@ class Reader {
   }
   int16_t i16() { return static_cast<int16_t>(u16()); }
   int32_t i32() { return static_cast<int32_t>(u32()); }
+  template <size_t N>
+  std::array<uint8_t, N> bytes() {
+    std::array<uint8_t, N> a{};
+    for (uint8_t& b : a) b = u8();
+    return a;
+  }
   std::string str() {
     const size_t n = u8();
     if (!ok_ || pos_ + n > size_) {
@@ -90,11 +110,6 @@ class Reader {
     p.x = i32();
     p.y = i32();
     return p;
-  }
-  KeySet keys() {
-    KeySet k;
-    for (uint8_t& b : k.bits) b = u8();
-    return k;
   }
   Rect rect() {
     Rect r;
@@ -112,20 +127,17 @@ class Reader {
   bool ok_ = true;
 };
 
-}  // namespace
+uint8_t typeOf(const Body& body) { return static_cast<uint8_t>(body.index() + 1); }
 
-std::vector<uint8_t> encode(const Packet& packet) {
-  Writer w;
-  w.u32(kMagic);
-  w.u8(kVersion);
-  w.u8(static_cast<uint8_t>(packet.body.index() + 1));
-  w.u64(packet.sender);
-  w.u32(packet.seq);
+bool isSealedOnly(uint8_t type) { return type == 3 || type == 4 || type == 5 || type == 6 || type == 8; }
+
+void encodeBody(Writer& w, const Body& body) {
   std::visit(
       [&w](const auto& m) {
         using T = std::decay_t<decltype(m)>;
         if constexpr (std::is_same_v<T, MasterAnnounce>) {
           w.str(m.name);
+          w.bytes(m.publicKey);
         } else if constexpr (std::is_same_v<T, SlaveHello>) {
           w.str(m.name);
           w.u64(m.masterId);
@@ -133,7 +145,11 @@ std::vector<uint8_t> encode(const Packet& packet) {
           const size_t n = std::min(m.monitors.size(), kMaxMonitors);
           w.u8(static_cast<uint8_t>(n));
           for (size_t i = 0; i < n; ++i) w.rect(m.monitors[i]);
-          w.u32(m.address);  // appended field: older decoders ignore trailing bytes
+          w.u32(m.address);
+          w.bytes(m.publicKey);
+          w.bytes(m.sessionNonce);
+          w.u64(m.sessionId);
+          w.bytes(m.mac);
         } else if constexpr (std::is_same_v<T, SlaveConfig>) {
           w.u64(m.target);
           w.u32(m.version);
@@ -144,33 +160,31 @@ std::vector<uint8_t> encode(const Packet& packet) {
           w.u8(m.buttons);
           w.i16(m.wheelV);
           w.i16(m.wheelH);
-          w.keys(m.keys);  // appended field: older decoders ignore trailing bytes
+          w.bytes(m.keys.bits);
         } else if constexpr (std::is_same_v<T, Leave>) {
           w.u64(m.target);
         } else if constexpr (std::is_same_v<T, Key>) {
           w.u64(m.target);
           w.u16(m.code);
           w.u8(m.value);
-          w.keys(m.held);
+          w.bytes(m.held.bits);
+        } else if constexpr (std::is_same_v<T, SessionInit>) {
+          w.u64(m.target);
+          w.bytes(m.masterNonce);
+          w.bytes(m.slaveNonce);
         }
+        // Sealed is never encoded field by field: its datagram is already complete.
       },
-      packet.body);
-  return std::move(w.buf);
+      body);
 }
 
-std::optional<Packet> decode(const uint8_t* data, size_t size) {
-  Reader r(data, size);
-  if (r.u32() != kMagic || r.u8() != kVersion) return std::nullopt;
-  const uint8_t type = r.u8();
-  Packet p;
-  p.sender = r.u64();
-  p.seq = r.u32();
+std::optional<Body> decodeBody(Reader& r, uint8_t type) {
   switch (type) {
     case 1: {
       MasterAnnounce m;
       m.name = r.str();
-      p.body = std::move(m);
-      break;
+      m.publicKey = r.bytes<32>();
+      return m;
     }
     case 2: {
       SlaveHello m;
@@ -180,17 +194,19 @@ std::optional<Packet> decode(const uint8_t* data, size_t size) {
       const size_t n = r.u8();
       if (n > kMaxMonitors) return std::nullopt;
       for (size_t i = 0; i < n && r.ok(); ++i) m.monitors.push_back(r.rect());
-      if (r.remaining() != 0) m.address = r.u32();  // absent in hellos from older slaves; never partial
-      p.body = std::move(m);
-      break;
+      m.address = r.u32();
+      m.publicKey = r.bytes<32>();
+      m.sessionNonce = r.bytes<16>();
+      m.sessionId = r.u64();
+      m.mac = r.bytes<16>();
+      return m;
     }
     case 3: {
       SlaveConfig m;
       m.target = r.u64();
       m.version = r.u32();
       m.offset = r.point();
-      p.body = m;
-      break;
+      return m;
     }
     case 4: {
       Pointer m;
@@ -199,33 +215,131 @@ std::optional<Packet> decode(const uint8_t* data, size_t size) {
       m.buttons = r.u8();
       m.wheelV = r.i16();
       m.wheelH = r.i16();
-      if (r.remaining() != 0) {  // absent in pointers from older masters; never partial
-        m.hasKeys = true;
-        m.keys = r.keys();
-      }
-      p.body = m;
-      break;
+      m.keys.bits = r.bytes<32>();
+      return m;
     }
     case 5: {
       Leave m;
       m.target = r.u64();
-      p.body = m;
-      break;
+      return m;
     }
     case 6: {
       Key m;
       m.target = r.u64();
       m.code = r.u16();
       m.value = r.u8();
-      m.held = r.keys();
-      p.body = m;
-      break;
+      m.held.bits = r.bytes<32>();
+      return m;
+    }
+    case 8: {
+      SessionInit m;
+      m.target = r.u64();
+      m.masterNonce = r.bytes<16>();
+      m.slaveNonce = r.bytes<16>();
+      return m;
     }
     default:
       return std::nullopt;
   }
+}
+
+uint64_t targetOf(const Body& body) {
+  return std::visit(
+      [](const auto& m) -> uint64_t {
+        using T = std::decay_t<decltype(m)>;
+        if constexpr (std::is_same_v<T, MasterAnnounce> || std::is_same_v<T, SlaveHello>) {
+          return 0;
+        } else {
+          return m.target;
+        }
+      },
+      body);
+}
+
+}  // namespace
+
+std::vector<uint8_t> encode(const Packet& packet) {
+  if (const auto* sealed = std::get_if<Sealed>(&packet.body)) return sealed->datagram;
+  Writer w;
+  w.header(typeOf(packet.body), packet.sender, packet.seq);
+  encodeBody(w, packet.body);
+  return std::move(w.buf);
+}
+
+std::vector<uint8_t> seal(const Packet& inner, uint64_t target, KeyKind kind, const crypto::Key& key) {
+  Writer plain;
+  plain.u8(typeOf(inner.body));
+  encodeBody(plain, inner.body);
+
+  Writer w;
+  w.header(kSealedType, inner.sender, inner.seq);
+  w.u64(target);
+  w.u8(static_cast<uint8_t>(kind));
+  const auto nonce = crypto::randomArray<std::array<uint8_t, crypto::kNonceSize>>();
+  w.bytes(nonce);
+  std::vector<uint8_t> out = std::move(w.buf);
+  const size_t adSize = out.size();
+  out.resize(adSize + plain.buf.size() + crypto::kMacSize);
+  crypto::seal(key, nonce.data(), out.data(), adSize, plain.buf.data(), plain.buf.size(), out.data() + adSize,
+               out.data() + adSize + plain.buf.size());
+  return out;
+}
+
+std::optional<Packet> decode(const uint8_t* data, size_t size) {
+  Reader r(data, size);
+  if (r.u32() != kMagic || r.u8() != kVersion) return std::nullopt;
+  const uint8_t type = r.u8();
+  Packet p;
+  p.sender = r.u64();
+  p.seq = r.u32();
   if (!r.ok()) return std::nullopt;
+  if (type == kSealedType) {
+    Sealed s;
+    s.target = r.u64();
+    const uint8_t kind = r.u8();
+    if (!r.ok() || kind > 1 || size < kSealedAdSize + 1 + crypto::kMacSize) return std::nullopt;
+    s.kind = static_cast<KeyKind>(kind);
+    s.datagram.assign(data, data + size);
+    p.body = std::move(s);
+    return p;
+  }
+  if (isSealedOnly(type)) return std::nullopt;  // control messages are never accepted unencrypted
+  auto body = decodeBody(r, type);
+  if (!body || !r.ok() || r.remaining() != 0) return std::nullopt;
+  p.body = std::move(*body);
   return p;
+}
+
+std::optional<Packet> open(const Packet& sealedPacket, const crypto::Key& key) {
+  const auto* s = std::get_if<Sealed>(&sealedPacket.body);
+  if (!s || s->datagram.size() < kSealedAdSize + 1 + crypto::kMacSize) return std::nullopt;
+  const uint8_t* data = s->datagram.data();
+  const size_t cipherSize = s->datagram.size() - kSealedAdSize - crypto::kMacSize;
+  std::vector<uint8_t> plain(cipherSize);
+  if (!crypto::open(key, data + kSealedAdSize - crypto::kNonceSize, data, kSealedAdSize, data + kSealedAdSize,
+                    cipherSize, data + kSealedAdSize + cipherSize, plain.data())) {
+    return std::nullopt;
+  }
+  Reader r(plain.data(), plain.size());
+  const uint8_t type = r.u8();
+  if (!isSealedOnly(type)) return std::nullopt;
+  auto body = decodeBody(r, type);
+  if (!body || !r.ok() || r.remaining() != 0) return std::nullopt;
+  if (targetOf(*body) != s->target) return std::nullopt;  // the readable target must match the sealed one
+  Packet p;
+  p.sender = sealedPacket.sender;
+  p.seq = sealedPacket.seq;
+  p.body = std::move(*body);
+  return p;
+}
+
+std::vector<uint8_t> helloAuthData(uint64_t sender, const SlaveHello& hello) {
+  SlaveHello copy = hello;
+  copy.mac = {};
+  Packet p;
+  p.sender = sender;
+  p.body = std::move(copy);
+  return encode(p);
 }
 
 }  // namespace nm::proto

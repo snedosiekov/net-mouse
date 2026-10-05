@@ -1,14 +1,17 @@
 #pragma once
 
-// Slave role: announces itself, applies the layout configuration received from a master and turns
-// the master's pointer stream into local input.
+// Slave role: announces itself, pairs with one master (the first one that connects it; others are
+// refused until forgetMaster()), agrees a fresh session key with it on every (re)start, and turns
+// the master's sealed pointer/keyboard stream into local input.
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "core/config.h"
+#include "core/crypto.h"
 #include "core/protocol.h"
 #include "core/transport.h"
 #include "platform/platform.h"
@@ -16,14 +19,18 @@
 namespace nm {
 
 struct SlaveSnapshot {
-  bool configured = false;
+  bool paired = false;      // trusts a master (its key is pinned)
+  bool connected = false;   // encrypted session with it established
+  bool configured = false;  // received its position from the master
   uint64_t masterId = 0;
   std::string masterName;
+  std::string masterFingerprint;
   uint32_t masterIp = 0;
   bool masterOnline = false;
   Point offset;
   bool active = false;  // the master's pointer is currently on this PC
   std::vector<MonitorInfo> monitors;
+  std::string fingerprint;  // this PC's
 };
 
 class SlaveEngine {
@@ -31,6 +38,7 @@ class SlaveEngine {
   struct Options {
     uint64_t id = 0;
     std::string name;
+    crypto::Identity identity;
   };
 
   SlaveEngine(Options options, Config& config, ITransport& transport, IDisplays& displays,
@@ -41,8 +49,14 @@ class SlaveEngine {
 
   SlaveSnapshot snapshot() const;
   uint64_t changeCounter() const { return changes_.load(); }
+  // Drops the trusted master, so another master can connect this PC.
+  void forgetMaster();
 
  private:
+  void handleAnnounceLocked(const proto::MasterAnnounce& a, uint64_t sender, uint32_t ip, uint64_t nowMs);
+  void handleSessionInitLocked(const proto::Packet& sealed, uint32_t ip, uint64_t nowMs);
+  void handleSealedLocked(const proto::Packet& sealed, uint64_t nowMs);
+  void handleConfigLocked(const proto::SlaveConfig& cfg);
   void sendHelloLocked();
   bool acceptSeqLocked(uint32_t seq);
   void handlePointerLocked(const proto::Pointer& p, uint64_t nowMs);
@@ -60,7 +74,20 @@ class SlaveEngine {
 
   mutable std::mutex mutex_;
   std::vector<MonitorInfo> monitors_;
+
+  // Trusted master (pinned public key) and the current session with it.
+  bool hasTrusted_ = false;
   uint64_t masterId_ = 0;
+  crypto::Key masterKey_{};
+  crypto::Key pairKey_{};
+  crypto::Nonce16 sessionNonce_{};  // the next session must be built from this; renewed after each use
+  bool hasSession_ = false;
+  crypto::Key sessionKey_{};
+  uint64_t sessionId_ = 0;
+  std::map<uint64_t, crypto::Key> announcedKeys_;  // masters seen on the network (for pairing)
+  bool refusedLogged_ = false;
+  bool impostorLogged_ = false;
+
   uint32_t configVersion_ = 0;
   Point offset_;
   std::string masterName_;

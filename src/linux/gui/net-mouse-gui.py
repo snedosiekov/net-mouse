@@ -27,6 +27,20 @@ SNAP_PX = 12
 MASTER_COLORS = ("#447fdb", "#3a71cc")  # (upper, lower) half of a screen: a subtle sheen
 SLAVE_COLORS = ("#33a873", "#2b9866")
 SLAVE_DRAG_COLORS = ("#62cf97", "#55c18a")
+CONNECTING_COLORS = ("#9aa3b1", "#8c95a3")
+AVAILABLE_COLORS = ("#8492a8", "#768399")
+WARNING_COLORS = ("#e2605a", "#cf4d47")
+STRIP_HEIGHT = 104
+
+
+def in_layout(v):
+    """Slaves shown in the arrangement: connected (or being connected) with a trusted key."""
+    return v.get("paired") and not v.get("key_mismatch")
+
+
+def is_available(v):
+    """Slaves shown as cards in the 'Available' strip."""
+    return v["online"] and not in_layout(v)
 BEZEL = "#22262e"
 SHADOW = "#c9cfd9"
 GRID_DOT = "#d6dbe4"
@@ -146,11 +160,15 @@ class App:
                        value="master").pack(side="left")
         tk.Radiobutton(roles, text="Slave", variable=self.role_var, value="slave").pack(side="left", padx=8)
         tk.Button(this_pc, text="Apply role", command=self.apply_role).grid(row=1, column=4, padx=2, pady=(6, 0))
+        self.forget_button = tk.Button(this_pc, text="Forget master", command=self.forget_master)
+        self.forget_button.grid(row=1, column=3, padx=2, pady=(6, 0))
         this_pc.columnconfigure(1, weight=1)
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_motion)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<ButtonPress-3>", self.on_right_click)
+        self.cards = []  # (x0, y0, x1, y1, slave) of the Available strip
         self.canvas.bind("<Configure>", lambda _e: self.redraw())
         self.monitors_loaded = False
         self.poll()
@@ -208,6 +226,32 @@ class App:
         if messagebox.askokcancel("Net Mouse", f"Switch this PC to {role}? The service restarts."):
             self.send("set-role " + role)
 
+    def forget_master(self):
+        if messagebox.askokcancel("Net Mouse", "Forget the master this PC is paired with?\n\nIt will no longer "
+                                               "control this PC until a master connects it again."):
+            self.send("forget-master")
+
+    def connect_slave(self, v):
+        if v.get("other_master"):
+            messagebox.showinfo("Net Mouse", f"\"{v['name']}\" is paired with another master.\n\nOn that PC choose "
+                                             "\"Forget master\" (or run: net-mouse-ctl forget-master), then connect it here.")
+            return
+        warning = ("\n\nWARNING: this PC now has a different key than the one connected before. Only continue if it "
+                   "was reinstalled.") if v.get("key_mismatch") else ""
+        if messagebox.askokcancel("Net Mouse", f"Connect \"{v['name']}\" ({v['ip']})?\n\nFingerprint: "
+                                               f"{v['fingerprint']}\n\nCheck that Net Mouse on that PC shows the same "
+                                               f"fingerprint. Once connected, this master controls it over an "
+                                               f"encrypted channel.{warning}"):
+            if v.get("key_mismatch"):
+                self.send(f"unpair {v['id']}")
+            self.send(f"pair {v['id']}")
+
+    def on_right_click(self, event):
+        v = self.slave_at(event.x, event.y)
+        if v and messagebox.askokcancel("Net Mouse", f"Disconnect \"{v['name']}\"?\n\nThis master stops controlling "
+                                                     "it; it goes back to Available."):
+            self.send(f"unpair {v['id']}")
+
     def on_detect(self):
         spec = detect_monitors(self.root)
         if spec:
@@ -220,34 +264,47 @@ class App:
     def update_texts(self):
         s = self.status
         role = s.get("role", "?")
-        self.header.config(text=f"{role.upper()} • {s.get('name', '')} • id {s.get('id', '')}")
+        self.header.config(text=f"{role.upper()} \u2022 {s.get('name', '')} \u2022 fingerprint {s.get('fingerprint', '')}")
+        self.forget_button.config(state="normal" if role == "slave" and s.get("paired") else "disabled")
         lines = []
         if role == "master":
             slaves = s.get("slaves", [])
             if s.get("remote"):
                 active = next((v["name"] for v in slaves if v["id"] == s.get("active")), "?")
-                lines.append(f"Pointer is on slave \"{active}\"  (Ctrl+Alt+Home brings it back)")
+                lines.append(f"Pointer and keyboard are on \"{active}\"  (Ctrl+Alt+Home brings them back)")
             else:
                 lines.append("Pointer is on this PC")
             if not slaves:
-                lines.append("No slaves found yet. Install Net Mouse on another PC as slave.")
+                lines.append("No other PCs found yet. Install Net Mouse on another PC as slave.")
             for v in slaves:
-                state = "online" + ("" if v["synced"] else ", syncing") if v["online"] else "offline"
-                lines.append(f"  • {v['name']}  {v['ip']}  {state}  origin "
-                             f"({v['offset']['x']}, {v['offset']['y']})")
-            lines.append("Drag the green slave screens to where they physically are; "
-                         "the pointer crosses where screens touch.")
+                if not v["online"]:
+                    state = "connected, offline" if v["paired"] else "offline"
+                elif v["key_mismatch"]:
+                    state = "KEY CHANGED \u2014 not trusted"
+                elif not v["paired"]:
+                    state = "paired with another master" if v["other_master"] else "available"
+                elif not v["connected"]:
+                    state = "connecting\u2026"
+                else:
+                    state = "connected (encrypted)" if v["synced"] else "connected, syncing"
+                lines.append(f"  \u2022 {v['name']}  {v['ip']}  {state}  \u2022  fingerprint {v['fingerprint']}")
+            lines.append("Click an available PC to connect it, drag connected screens to where they are; "
+                         "right-click one to disconnect.")
         else:
             m = s.get("master", {})
-            if not s.get("configured"):
-                lines.append(f"Master \"{m.get('name')}\" found, waiting for its configuration…"
-                             if m.get("online") else "Looking for a master on the local network…")
+            if not s.get("paired"):
+                lines.append(f"Not connected. On the master \"{m.get('name')}\", click this PC (fingerprint "
+                             f"{s.get('fingerprint')}) under Available." if m.get("online")
+                             else "Not connected. Looking for a master on the local network\u2026")
             else:
-                lines.append(f"Master \"{m.get('name') or m.get('id')}\" "
-                             f"{'online' if m.get('online') else 'offline'} • this desktop's origin is at "
-                             f"({s['offset']['x']}, {s['offset']['y']}) in the master layout")
-            lines.append("The master's pointer is on this PC" if s.get("active") else "Idle")
-            lines.append("Arrange this PC's position in the master's Net Mouse window.")
+                state = "offline" if not m.get("online") else (
+                    "connected (encrypted)" if s.get("connected") else "connecting\u2026")
+                lines.append(f"Paired with master \"{m.get('name')}\" (fingerprint {m.get('fingerprint')}) "
+                             f"\u2022 {state}")
+                if s.get("configured"):
+                    lines.append(f"This desktop's origin is at ({s['offset']['x']}, {s['offset']['y']}) in the "
+                                 "master layout")
+            lines.append("The master's pointer and keyboard are on this PC" if s.get("active") else "Idle")
         self.info.config(text="\n".join(lines))
 
     # ------------------------------------------------------------------ canvas
@@ -261,13 +318,14 @@ class App:
             label = f"{title} {i + 1}\n{m['w']} × {m['h']}" + ("\nprimary" if m["primary"] else "")
             out.append(((m["x"], m["y"], m["w"], m["h"]), "master", None, label))
         for v in s.get("slaves", []):
-            if not v["online"] and not (self.drag and self.drag["id"] == v["id"]):
+            if not in_layout(v) or (not v["online"] and not (self.drag and self.drag["id"] == v["id"])):
                 continue
             ox, oy = self.offset_of(v)
             for k, r in enumerate(v["monitors"]):
                 label = v["name"] + (f" #{k + 1}" if len(v["monitors"]) > 1 else "")
                 label += f"\n{v['ip']}" if v.get("ip") else ""
-                label += f"\n{r['w']} × {r['h']}" + ("" if v["synced"] else "\nsyncing…")
+                label += f"\n{r['w']} × {r['h']}"
+                label += "\nconnecting\u2026" if not v["connected"] else ("" if v["synced"] else "\nsyncing\u2026")
                 out.append(((r["x"] + ox, r["y"] + oy, r["w"], r["h"]), "slave", v, label))
         return out
 
@@ -276,8 +334,8 @@ class App:
             return self.drag["offset"]
         return v["offset"]["x"], v["offset"]["y"]
 
-    def compute_transform(self, rects):
-        cw, ch = max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1)
+    def compute_transform(self, rects, strip=0):
+        cw, ch = max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height() - strip, 1)
         if not rects:
             self.scale, self.origin = 0.1, (0.0, 0.0)
             return
@@ -297,9 +355,11 @@ class App:
         c = self.canvas
         c.delete("all")
         screens = self.screens()
-        if not self.drag:
-            self.compute_transform([r for r, _, _, _ in screens])
         s = self.status or {}
+        available = [v for v in s.get("slaves", []) if is_available(v)] if s.get("role") == "master" else []
+        strip = STRIP_HEIGHT if available else 0
+        if not self.drag:
+            self.compute_transform([r for r, _, _, _ in screens], strip)
         w_c, h_c = c.winfo_width(), c.winfo_height()
         for gy in range(11, h_c, 22):  # faint dot grid
             for gx in range(11, w_c, 22):
@@ -310,9 +370,32 @@ class App:
             active = v is not None and s.get("remote") and s.get("active") == v["id"]
             if kind == "master":
                 colors = MASTER_COLORS
+            elif self.drag and self.drag["id"] == v["id"]:
+                colors = SLAVE_DRAG_COLORS
             else:
-                colors = SLAVE_DRAG_COLORS if self.drag and self.drag["id"] == v["id"] else SLAVE_COLORS
+                colors = SLAVE_COLORS if v["connected"] else CONNECTING_COLORS
             self.draw_monitor(x0, y0, x1, y1, colors, active, label.split("\n"))
+        self.cards = []
+        if available:  # "Available" strip: one card per discovered PC that is not connected
+            top = h_c - strip
+            c.create_line(12, top, w_c - 12, top, fill="#c3cad6")
+            c.create_text(16, top + 12, anchor="w", fill="#46505f", font=self.body_font,
+                          text="Available \u2014 click a PC to connect it")
+            x = 16
+            for v in available:
+                if x + 230 > w_c:
+                    break
+                lines = [v["name"], f"{v['ip']}  \u2022  {v['fingerprint']}"]
+                colors = AVAILABLE_COLORS
+                if v["key_mismatch"]:
+                    lines.append("key changed \u2014 click to trust it")
+                    colors = WARNING_COLORS
+                elif v["other_master"]:
+                    lines.append("paired with another master")
+                    colors = CONNECTING_COLORS
+                self.draw_monitor(x, top + 28, x + 230, top + 94, colors, False, lines)
+                self.cards.append((x, top + 28, x + 230, top + 94, v))
+                x += 242
         if s.get("role") == "master" and s.get("remote"):
             px, py = self.to_canvas(s["pointer"]["x"], s["pointer"]["y"])
             c.create_oval(px - 8, py - 8, px + 8, py + 8, fill="white", outline="")
@@ -354,11 +437,30 @@ class App:
                           fill="white" if i == 0 else "#e6f0f5")
             y += heights[i]
 
+    def slave_at(self, x, y):
+        """The connected slave whose screen is at canvas position (x, y)."""
+        if not self.status or self.status.get("role") != "master":
+            return None
+        for v in reversed(self.status.get("slaves", [])):
+            if not v["online"] or not in_layout(v):
+                continue
+            ox, oy = v["offset"]["x"], v["offset"]["y"]
+            for r in v["monitors"]:
+                x0, y0 = self.to_canvas(r["x"] + ox, r["y"] + oy)
+                x1, y1 = self.to_canvas(r["x"] + ox + r["w"], r["y"] + oy + r["h"])
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    return v
+        return None
+
     def on_press(self, event):
         if not self.status or self.status.get("role") != "master":
             return
+        for x0, y0, x1, y1, v in self.cards:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                self.connect_slave(v)
+                return
         for v in reversed(self.status.get("slaves", [])):
-            if not v["online"]:
+            if not v["online"] or not in_layout(v):
                 continue
             ox, oy = v["offset"]["x"], v["offset"]["y"]
             for r in v["monitors"]:
@@ -394,7 +496,7 @@ class App:
         s = self.status
         others = [(m["x"], m["y"], m["x"] + m["w"], m["y"] + m["h"]) for m in s.get("monitors", [])]
         for v in s.get("slaves", []):
-            if v["id"] == moving["id"] or not v["online"]:
+            if v["id"] == moving["id"] or not v["online"] or not in_layout(v):
                 continue
             ox, oy = v["offset"]["x"], v["offset"]["y"]
             others += [(r["x"] + ox, r["y"] + oy, r["x"] + ox + r["w"], r["y"] + oy + r["h"]) for r in v["monitors"]]

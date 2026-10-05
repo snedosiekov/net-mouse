@@ -54,17 +54,23 @@ Startup is enabled by default; add `/MERGETASKS="!autostart"` to install without
 1. Start `net-mouse.exe` on every PC. On first start choose the role: **Master** on the PC whose mouse
    you use, **Slave** on the others. The choice is remembered. Change it later from the tray menu
    (*Change role…*).
-2. Each slave announces itself on the network. The master detects it, places it to the right of
-   its screens, and sends the slave its configuration.
-3. On the master, open *Arrange displays…* from the tray icon. Drag the green slave screens to where
-   the PCs physically stand. Edges snap together, and the pointer crosses only where screens touch.
+2. Each slave announces itself on the network. On the master, open *Arrange displays…* from the tray
+   icon: the slave appears under **Available** with its name, IP and key **fingerprint**. Click it, check
+   that the fingerprint matches the one shown in the slave's own Net Mouse window, and confirm. The
+   slave is now **connected**: everything between the two is encrypted (see [Security](#security)).
+   A slave trusts only the first master that connects it; *Forget master* in the slave's tray menu
+   (Linux: `net-mouse-ctl forget-master`) releases it for another master.
+3. Drag the green slave screens to where the PCs physically stand. Edges snap together, and the pointer
+   crosses only where screens touch. Right-click a slave screen to disconnect it.
 4. Net Mouse runs minimized in the notification area (system tray). The mouse icon is blue when idle
    and turns orange while the pointer is on a slave (on a slave: while it is being controlled). Its
    tooltip shows the current state. Click the icon to open the window. Minimizing or closing the window
    hides it to the tray again, and starting the app a second time opens the running instance. On
    Windows 11 new tray icons go to the overflow area; drag the icon onto the taskbar to keep it visible.
 5. Move the pointer over the edge. While it is on a slave, the master's cursor is hidden and the
-   master's clicks and wheel are sent to the slave.
+   master's clicks, wheel and **keyboard** go to that slave. Keys are sent as physical key positions,
+   so the slave's own keyboard layout applies. A key's release always goes where its press went, so
+   nothing sticks when the pointer moves between PCs. Ctrl+Alt+Del and Win+L stay on the master.
 
 **Emergency return:** **Ctrl+Alt+Home** or the tray item *Return pointer to this PC* brings the pointer
 back to the master at once. A slave that disappears from the network also returns the pointer
@@ -101,10 +107,11 @@ Testing on a single PC: run a master and a `--dry-run` slave side by side, each 
 | `group`, `port` | `239.255.77.77`, `47800` | multicast group and UDP port (must match on all PCs) |
 | `interface` | empty | local IPv4 address to pin traffic to; empty = all interfaces |
 | `hide_cursor` | `1` | master: hide the local cursor while the pointer is on a slave |
-| `slave.<id>.x/.y` | | master: saved position of each slave |
-| `master_id`, `offset_x/_y`, `config_version` | | slave: last configuration received |
+| `slave.<id>.x/.y`, `slave.<id>.key` | | master: saved position and pinned public key of each connected slave |
+| `master_id`, `master_key`, `offset_x/_y`, `config_version` | | slave: the paired master and the last configuration |
 
-Logs: `netmouse-master.log` / `netmouse-slave.log` next to the settings file.
+This PC's private key is in `netmouse.key` next to the settings file; it never leaves the PC. Logs:
+`netmouse-master.log` / `netmouse-slave.log` in the same folder.
 
 ## How it works
 
@@ -124,7 +131,11 @@ Logs: `netmouse-master.log` / `netmouse-slave.log` next to the settings file.
   delta from the park point and applied to a virtual pointer. All mouse events are swallowed so the
   master doesn't react to them. When the virtual pointer moves back onto a master monitor, the real
   cursor is placed there and normal operation continues.
-* **Injection (slave):** `SendInput` with absolute virtual-desktop coordinates, button and wheel events.
+* **Keyboard (master):** a low-level keyboard hook; while the pointer is on a slave, keys are swallowed
+  and sent to it. The emergency hotkey is detected by the engine itself, because Windows hotkeys cannot
+  fire while keys are swallowed.
+* **Injection (slave):** `SendInput` with absolute virtual-desktop coordinates, button, wheel and
+  scan-code key events.
 * Edge crossing is blocked while a button is held, so a drag never starts on one PC and ends on another.
 
 No kernel driver is needed for this. User-mode hooks and `SendInput` cover normal desktop use (see
@@ -132,22 +143,48 @@ No kernel driver is needed for this. User-mode hooks and `SendInput` cover norma
 
 ### Protocol
 
-UDP multicast `239.255.77.77:47800`, TTL 1. Every datagram starts with a header: magic `NMSE`,
-version, type, 64-bit sender id and a sequence number. All integers are little-endian. See
+UDP multicast `239.255.77.77:47800`, TTL 1, protocol version 2. Every datagram starts with a readable
+header: magic `NMSE`, version, type, 64-bit sender id and a sequence number (little-endian). See
 [src/core/protocol.h](src/core/protocol.h).
 
-| Message | Direction | When |
-|---|---|---|
-| `MasterAnnounce` | master → all | every second |
-| `SlaveHello` (name, monitors, applied master id + config version) | slave → all | every second, and as an acknowledgement |
-| `SlaveConfig` (target, version, offset) | master → slave | until the slave's hello acknowledges that version |
-| `Pointer` (target, layout position, button mask, wheel) | master → slave | every mouse event, plus a 100 ms heartbeat |
-| `Leave` (target) | master → slave | pointer left that slave |
+Only discovery is plain text. Everything that controls a PC travels in a **sealed** envelope: the
+header plus the target id, key kind and a random 24-byte nonce stay readable for routing but are
+authenticated; the message itself is encrypted (XChaCha20-Poly1305). A control message that arrives
+unencrypted is dropped.
 
-Loss handling: each `Pointer` carries the *complete* button state, so a lost press or release is
-repaired by the next packet. Button and wheel packets are sent twice and the slave drops
-duplicates by sequence number. A slave releases all buttons if the pointer stream stops for 1.5 s.
-A master treats a slave as gone after 3.5 s without a hello.
+| Message | Direction | Sealed | When |
+|---|---|---|---|
+| `MasterAnnounce` (name, public key) | master → all | no | every second |
+| `SlaveHello` (name, monitors, public key, paired master, config version, session nonce + id, MAC) | slave → all | no (MAC) | every second, and as an acknowledgement |
+| `SessionInit` (master nonce, echo of the slave's nonce) | master → slave | pair key | to (re)start a session |
+| `SlaveConfig` (version, offset) | master → slave | session key | until the slave's hello acknowledges that version |
+| `Pointer` (layout position, buttons, wheel, held keys) | master → slave | session key | every mouse event, plus a 100 ms heartbeat |
+| `Key` (key code, press/release/repeat, held keys) | master → slave | session key | every key event |
+| `Leave` | master → slave | session key | pointer left that slave |
+
+Loss handling: each `Pointer` carries the *complete* button state and the set of keys held for that
+slave, and each `Key` carries the held keys too, so a lost press or release is repaired by the next
+packet. Button, wheel and key packets are sent twice and the slave drops duplicates by sequence
+number. A slave releases all buttons and keys if the stream stops for 1.5 s. A master treats a slave as
+gone after 3.5 s without a hello.
+
+### Security
+
+* **Identity:** every PC creates an X25519 key pair on first start (`netmouse.key`). The public key and a
+  short fingerprint of it are part of discovery.
+* **Pairing** happens on the master: a discovered PC is only *available* until the user connects it,
+  which pins its public key. The slave pins the master's key at the same moment and refuses other
+  masters until *Forget master*. A PC that later announces a different key is flagged and not trusted.
+* **Pair key:** master and slave each compute `BLAKE2b(X25519(own secret, peer public) ‖ master pub ‖ slave pub)`:
+  only those two PCs can derive it. Hellos from a paired slave carry a MAC with it.
+* **Sessions:** on every (re)start of either side the master sends a `SessionInit`, sealed with the pair
+  key, that echoes the slave's current random nonce. The session key is derived from the pair key and
+  both nonces; the slave renews its nonce after each handshake. Recorded traffic or an old handshake
+  therefore never works again, and within a session the sequence number must always increase.
+* **Library:** [Monocypher](https://monocypher.org) 4.0.2 (`third_party/monocypher`, compiled in);
+  random numbers from the OS (`BCryptGenRandom` / `getrandom`).
+* Discovery is not secret: anyone on the LAN can see which PCs run Net Mouse, their names, screen sizes
+  and public keys. Check the fingerprint when connecting a PC if the network is not trusted.
 
 ## Linux (prototype)
 
@@ -192,6 +229,8 @@ sudo net-mouse-ctl role master       # change it (restarts the service)
 net-mouse-ctl monitors               # configured and detected layout
 sudo net-mouse-ctl monitors 2560x1440+0+0,1920x1080+2560+0     # or: auto
 net-mouse-ctl status                 # service state + what the daemon sees (JSON)
+net-mouse-ctl fingerprint            # this PC's key fingerprint (compare it when connecting)
+sudo net-mouse-ctl forget-master     # slave: release it so another master can connect it
 net-mouse-ctl logs                   # follow the journal
 net-mouse-ctl gui                    # settings window
 ```
@@ -201,9 +240,11 @@ net-mouse-ctl gui                    # settings window
 Start it from the application menu (*Net Mouse*) or with `net-mouse-gui`. It talks to the service over
 `/run/net-mouse/control.sock`:
 
-* **master:** the same arrangement editor as on Windows. Drag the green slave screens next to the
-  master's monitors; edges snap together, and the pointer crosses where screens touch.
-* **This PC:** the monitor layout (*Detect* reads it from `xrandr`, *Auto* uses the DRM detection) and the role.
+* **master:** the same arrangement editor as on Windows. Discovered PCs are listed under *Available*:
+  click one to connect it (compare the fingerprint). Drag the green slave screens next to the master's
+  monitors; edges snap together, and the pointer crosses where screens touch. Right-click to disconnect.
+* **This PC:** the monitor layout (*Detect* reads it from `xrandr`, *Auto* uses the DRM detection), the
+  role, and on a slave *Forget master*.
 
 Anyone can view the status. Changes need root or membership in `sudo`, `wheel`, `admin` or `netmouse`.
 
@@ -250,18 +291,18 @@ Prototype limitations:
 
 ## Limitations
 
-* **Mouse only.** Keyboard input stays on the master; keyboard sharing is the obvious next step.
 * **Elevated windows on a slave:** Windows blocks `SendInput` into windows of a higher integrity
   level (UIPI). Run the slave as administrator to control admin windows.
 * **Secure desktop** (UAC prompts, Ctrl+Alt+Del, the lock and logon screens) can't be controlled from
   a user-session app. That needs a Windows service running in the `SYSTEM` session (or a filter
   driver such as Interception), which is a candidate for a later iteration.
 * Pointer speed is 1:1 in physical pixels. Screens with very different DPI feel different in size.
-* Several masters on one network see each other (a warning is logged). A slave follows the most recent
-  master that configured it.
+* Several masters may share a network (a warning is logged); each slave belongs to the master that
+  connected it.
+* No clipboard sharing yet.
 
 ## Roadmap
 
 * **Linux, next steps:** a tray icon; reading the monitor layout from Wayland (`wl_output` /
   `xdg-output`) automatically; touchpad support on the master; .deb/.rpm packages.
-* Keyboard sharing, clipboard sharing, optional encryption and authentication of the protocol.
+* Clipboard sharing; key rotation for long-running sessions.

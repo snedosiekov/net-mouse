@@ -1,14 +1,16 @@
-// Minimal self-contained tests: protocol round trips, layout geometry and an end-to-end
-// master <-> slave session driven through fake platform objects.
+// Minimal self-contained tests: protocol and crypto round trips, layout geometry, and master <-> slave
+// sessions (pairing, pointer, keyboard, attacks) driven through fake platform objects.
 
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "app/master_engine.h"
 #include "app/slave_engine.h"
 #include "core/config.h"
+#include "core/crypto.h"
 #include "core/keymap.h"
 #include "core/layout.h"
 #include "core/protocol.h"
@@ -25,6 +27,8 @@ static int g_failures = 0;
   } while (0)
 
 namespace {
+
+namespace fs = std::filesystem;
 
 struct FakeTransport : ITransport {
   std::vector<std::vector<uint8_t>> sent;
@@ -57,6 +61,9 @@ struct FakeInjector : IInjector {
   void key(uint16_t code, int value) override { keys.push_back({code, value}); }
 };
 
+using KeyEvents = std::vector<std::pair<uint16_t, int>>;
+
+// Delivers everything `from` sent to `to` (like the multicast group would) and clears it.
 template <typename Engine>
 void deliver(FakeTransport& from, Engine& to, uint64_t now) {
   auto packets = std::move(from.sent);
@@ -68,38 +75,162 @@ void deliver(FakeTransport& from, Engine& to, uint64_t now) {
   }
 }
 
+fs::path tempFile(const std::string& name) { return fs::temp_directory_path() / name; }
+
+// A master (id 1) and a slave (id 2) with fresh identities and settings.
+struct Rig {
+  explicit Rig(const std::string& tag, Rect slaveScreen = {0, 0, 2560, 1440}) {
+    masterPath = tempFile("nm_test_" + tag + "_master.ini");
+    slavePath = tempFile("nm_test_" + tag + "_slave.ini");
+    fs::remove(masterPath);
+    fs::remove(slavePath);
+    masterCfg.load(masterPath);
+    slaveCfg.load(slavePath);
+    masterDisplays.list = {{{0, 0, 1920, 1080}, true, "M1"}};
+    slaveDisplays.list = {{slaveScreen, true, "S1"}};
+    masterIdentity = crypto::generateIdentity();
+    master = std::make_unique<MasterEngine>(MasterEngine::Options{1, "master", true, masterIdentity}, masterCfg,
+                                            masterNet, masterDisplays, cursor);
+    slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{2, "slave", crypto::generateIdentity()}, slaveCfg,
+                                          slaveNet, slaveDisplays, injector);
+  }
+  ~Rig() {
+    master.reset();
+    slave.reset();
+    fs::remove(masterPath);
+    fs::remove(slavePath);
+  }
+
+  // Announce + hello: the slave becomes "available" on the master.
+  void discover() {
+    master->tick(now);
+    slave->tick(now);
+    deliver(masterNet, *slave, now);
+    deliver(slaveNet, *master, now);
+  }
+  // Session handshake and configuration, after pairSlave() or a restart.
+  void handshake() {
+    for (int i = 0; i < 3; ++i) {
+      deliver(masterNet, *slave, now);  // SessionInit, then config
+      deliver(slaveNet, *master, now);  // hello with the session, then the configuration ack
+    }
+  }
+  void connect() {
+    discover();
+    CHECK(master->pairSlave(2));
+    handshake();
+  }
+
+  fs::path masterPath, slavePath;
+  Config masterCfg, slaveCfg;
+  FakeTransport masterNet, slaveNet;
+  FakeDisplays masterDisplays, slaveDisplays;
+  FakeCursor cursor;
+  FakeInjector injector;
+  crypto::Identity masterIdentity;
+  std::unique_ptr<MasterEngine> master;
+  std::unique_ptr<SlaveEngine> slave;
+  uint64_t now = 10'000;
+};
+
+// ---------------------------------------------------------------------------------------------
+
+void testCrypto() {
+  const auto a = crypto::generateIdentity();
+  const auto b = crypto::generateIdentity();
+  // Both sides derive the same pair key, and nobody else does.
+  CHECK(crypto::pairKey(a, b.publicKey, true) == crypto::pairKey(b, a.publicKey, false));
+  CHECK(crypto::pairKey(a, b.publicKey, true) != crypto::pairKey(crypto::generateIdentity(), b.publicKey, true));
+  const auto k = crypto::pairKey(a, b.publicKey, true);
+  const auto n1 = crypto::randomArray<crypto::Nonce16>();
+  const auto n2 = crypto::randomArray<crypto::Nonce16>();
+  CHECK(crypto::sessionKey(k, n1, n2) == crypto::sessionKey(k, n1, n2));
+  CHECK(crypto::sessionKey(k, n1, n2) != crypto::sessionKey(k, n2, n1));
+  const std::string fp = crypto::fingerprint(a.publicKey);
+  CHECK(fp.size() == 19 && fp[4] == '-' && fp[9] == '-' && fp[14] == '-');
+
+  // Identity files: created once, then loaded unchanged.
+  const fs::path keyFile = tempFile("nm_test_identity.key");
+  fs::remove(keyFile);
+  crypto::Identity created, loaded;
+  std::string error;
+  CHECK(crypto::loadOrCreateIdentity(keyFile, created, error));
+  CHECK(crypto::loadOrCreateIdentity(keyFile, loaded, error));
+  CHECK(created.secret == loaded.secret && created.publicKey == loaded.publicKey);
+  fs::remove(keyFile);
+}
+
 void testProtocol() {
   proto::Packet p;
   p.sender = 0x1122334455667788ull;
   p.seq = 0xDEADBEEF;
-  p.body = proto::SlaveHello{"pc-2", {{0, 0, 1920, 1080}, {-1280, 0, 0, 1024}}, 42, 7};
+  proto::SlaveHello hello{"pc-2", {{0, 0, 1920, 1080}, {-1280, 0, 0, 1024}}, 42, 7, 0x0A0A4597};
+  hello.publicKey = crypto::generateIdentity().publicKey;
+  hello.sessionNonce = crypto::randomArray<crypto::Nonce16>();
+  hello.sessionId = 99;
+  p.body = hello;
   auto bytes = proto::encode(p);
   auto d = proto::decode(bytes.data(), bytes.size());
   CHECK(d && d->sender == p.sender && d->seq == p.seq);
   const auto* h = d ? std::get_if<proto::SlaveHello>(&d->body) : nullptr;
-  CHECK(h && h->name == "pc-2" && h->monitors.size() == 2 && h->monitors[1].left == -1280 &&
-        h->masterId == 42 && h->configVersion == 7);
+  CHECK(h && h->name == "pc-2" && h->monitors.size() == 2 && h->monitors[1].left == -1280 && h->masterId == 42 &&
+        h->configVersion == 7 && h->address == 0x0A0A4597 && h->publicKey == hello.publicKey &&
+        h->sessionNonce == hello.sessionNonce && h->sessionId == 99);
+  CHECK(!proto::decode(bytes.data(), bytes.size() - 1));  // truncated
 
-  p.body = proto::Pointer{9, {-5, 70000}, proto::kButtonLeft | proto::kButtonX2, -120, 240, true, {}};
-  bytes = proto::encode(p);
+  // Sealed round trip.
+  const auto key = crypto::randomArray<crypto::Key>();
+  p.body = proto::Pointer{9, {-5, 70000}, proto::kButtonLeft | proto::kButtonX2, -120, 240, {}};
+  bytes = proto::seal(p, 9, proto::KeyKind::Session, key);
   d = proto::decode(bytes.data(), bytes.size());
-  const auto* ptr = d ? std::get_if<proto::Pointer>(&d->body) : nullptr;
+  const auto* sealed = d ? std::get_if<proto::Sealed>(&d->body) : nullptr;
+  CHECK(sealed && sealed->target == 9 && sealed->kind == proto::KeyKind::Session);
+  auto opened = d ? proto::open(*d, key) : std::nullopt;
+  const auto* ptr = opened ? std::get_if<proto::Pointer>(&opened->body) : nullptr;
   CHECK(ptr && ptr->target == 9 && ptr->pos.x == -5 && ptr->pos.y == 70000 && ptr->buttons == 0x11 &&
-        ptr->wheelV == -120 && ptr->wheelH == 240);
+        ptr->wheelV == -120 && ptr->wheelH == 240 && opened->seq == p.seq);
 
-  // The hello's main address is an appended field: a hello from an older slave (without it) still decodes.
-  p.body = proto::SlaveHello{"pc-2", {{0, 0, 1920, 1080}}, 42, 7, 0x0A0A4597};
-  auto withAddress = proto::encode(p);
-  auto d2 = proto::decode(withAddress.data(), withAddress.size());
-  CHECK(d2 && std::get<proto::SlaveHello>(d2->body).address == 0x0A0A4597);
-  auto d3 = proto::decode(withAddress.data(), withAddress.size() - 4);
-  CHECK(d3 && std::get<proto::SlaveHello>(d3->body).address == 0 &&
-        std::get<proto::SlaveHello>(d3->body).monitors.size() == 1);
+  // Wrong key, altered ciphertext, altered (readable) header: all rejected.
+  CHECK(d && !proto::open(*d, crypto::randomArray<crypto::Key>()));
+  for (size_t pos : {bytes.size() - 20, size_t{14}, size_t{20}}) {  // ciphertext, seq, target
+    auto tampered = bytes;
+    tampered[pos] ^= 0x01;
+    auto t = proto::decode(tampered.data(), tampered.size());
+    CHECK(!t || !proto::open(*t, key));
+  }
 
-  // Truncated or foreign datagrams are rejected.
-  CHECK(!proto::decode(bytes.data(), bytes.size() - 1));
+  // Control messages are never accepted unencrypted.
+  p.body = proto::Pointer{9, {1, 2}, 0, 0, 0, {}};
+  bytes = proto::encode(p);
+  CHECK(!proto::decode(bytes.data(), bytes.size()));
+  p.body = proto::SlaveConfig{9, 1, {0, 0}};
+  bytes = proto::encode(p);
+  CHECK(!proto::decode(bytes.data(), bytes.size()));
+
+  // Foreign datagrams are rejected.
   bytes[0] ^= 0xFF;
   CHECK(!proto::decode(bytes.data(), bytes.size()));
+}
+
+void testKeyProtocol() {
+  proto::Packet p;
+  p.sender = 5;
+  p.seq = 9;
+  proto::KeySet held;
+  held.set(29, true);
+  held.set(30, true);
+  p.body = proto::Key{77, 30, 1, held};
+  const auto key = crypto::randomArray<crypto::Key>();
+  auto bytes = proto::seal(p, 77, proto::KeyKind::Session, key);
+  auto d = proto::decode(bytes.data(), bytes.size());
+  auto opened = d ? proto::open(*d, key) : std::nullopt;
+  const auto* k = opened ? std::get_if<proto::Key>(&opened->body) : nullptr;
+  CHECK(k && k->target == 77 && k->code == 30 && k->value == 1 && k->held.has(29) && k->held.has(30) &&
+        !k->held.has(31));
+  // The readable target must match the sealed one.
+  bytes = proto::seal(p, 78, proto::KeyKind::Session, key);
+  d = proto::decode(bytes.data(), bytes.size());
+  CHECK(d && !proto::open(*d, key));
 }
 
 void testLayout() {
@@ -124,7 +255,7 @@ void testLayout() {
 }
 
 void testConfig() {
-  auto path = std::filesystem::temp_directory_path() / "nm_test_config.ini";
+  auto path = tempFile("nm_test_config.ini");
   Config c;
   c.load(path);
   c.set("role", "master");
@@ -134,33 +265,67 @@ void testConfig() {
   Config d;
   CHECK(d.load(path));
   CHECK(d.get("role") == "master" && d.getHex("id") == 0xABCDEF0123456789ull && d.getInt("neg") == -42);
-  std::filesystem::remove(path);
+  fs::remove(path);
+}
+
+void testKeymap() {
+  using namespace keymap;
+  CHECK(fromWindows(0x41, 0x1E, false) == 30);   // A
+  CHECK(fromWindows(0x7B, 0x58, false) == 88);   // F12
+  CHECK(fromWindows(0xA3, 0x1D, true) == 97);    // Right Ctrl
+  CHECK(fromWindows(0x26, 0x48, true) == 103);   // Up
+  CHECK(fromWindows(0x13, 0x45, false) == 119);  // Pause
+  CHECK(fromWindows(0x90, 0x45, true) == 69);    // NumLock (reported as extended)
+  CHECK(fromWindows(0xA2, 0x21D, false) == 0);   // fake Left Ctrl sent with AltGr
+  CHECK(fromWindows(0xAF, 0, false) == 115);     // Volume Up without a scan code
+  WinKey wk;
+  CHECK(toWindows(30, wk) && wk.scan == 0x1E && !wk.extended && wk.vk == 0);
+  CHECK(toWindows(103, wk) && wk.scan == 0x48 && wk.extended);
+  CHECK(toWindows(119, wk) && wk.vk == 0x13);
+  CHECK(toWindows(69, wk) && wk.vk == 0x90 && wk.extended);
+  // Every key Windows can report survives the round trip to an injectable key.
+  for (uint32_t scan = 1; scan <= 0x58; ++scan) {
+    const uint16_t code = fromWindows(0, scan, false);
+    if (code) CHECK(toWindows(code, wk));
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+
+void testPairing() {
+  Rig r("pairing", {0, 0, 1920, 1080});
+  r.discover();
+  // Discovered but not connected: listed as available, the pointer cannot go there.
+  auto snap = r.master->snapshot();
+  CHECK(snap.slaves.size() == 1 && snap.slaves[0].online && !snap.slaves[0].paired && !snap.slaves[0].connected);
+  CHECK(snap.slaves[0].fingerprint == r.slave->snapshot().fingerprint);
+  CHECK(!r.master->onMouseMove({1919, 500}));
+  CHECK(!r.slave->snapshot().paired);
+
+  CHECK(r.master->pairSlave(2));
+  r.handshake();
+  snap = r.master->snapshot();
+  CHECK(snap.slaves[0].paired && snap.slaves[0].connected && snap.slaves[0].synced);
+  const auto ss = r.slave->snapshot();
+  CHECK(ss.paired && ss.connected && ss.configured && ss.masterId == 1 && ss.masterFingerprint == snap.fingerprint);
+  CHECK(r.master->onMouseMove({1919, 500}));
+
+  // Disconnect: the pointer comes back and cannot go there again.
+  CHECK(r.master->unpairSlave(2));
+  CHECK(!r.master->snapshot().remote && !r.master->snapshot().slaves[0].paired);
+  CHECK(!r.master->onMouseMove({1919, 500}));
 }
 
 void testSession() {
-  auto dir = std::filesystem::temp_directory_path();
-  Config masterCfg, slaveCfg;
-  masterCfg.load(dir / "nm_test_master.ini");
-  slaveCfg.load(dir / "nm_test_slave.ini");
-
-  FakeTransport masterNet, slaveNet;
-  FakeDisplays masterDisplays, slaveDisplays;
-  masterDisplays.list = {{{0, 0, 1920, 1080}, true, "M1"}};
-  slaveDisplays.list = {{{0, 0, 2560, 1440}, true, "S1"}};
-  FakeCursor cursor;
-  FakeInjector injector;
-
-  MasterEngine master({1, "master", true}, masterCfg, masterNet, masterDisplays, cursor);
-  SlaveEngine slave({2, "slave"}, slaveCfg, slaveNet, slaveDisplays, injector);
-
-  uint64_t now = 10'000;
-  // Discovery and configuration handshake.
-  slave.tick(now);
-  deliver(slaveNet, master, now);  // hello -> master auto-places the slave and sends config
-  deliver(masterNet, slave, now);  // config -> slave applies it and acknowledges
-  deliver(slaveNet, master, now);  // ack
+  Rig r("session");
+  r.connect();
+  MasterEngine& master = *r.master;
+  SlaveEngine& slave = *r.slave;
+  FakeInjector& injector = r.injector;
+  FakeCursor& cursor = r.cursor;
+  uint64_t& now = r.now;
   auto snap = master.snapshot();
-  CHECK(snap.slaves.size() == 1 && snap.slaves[0].online && snap.slaves[0].synced);
+  CHECK(snap.slaves.size() == 1 && snap.slaves[0].connected && snap.slaves[0].synced);
   CHECK(snap.slaves[0].offset == Point(1920, 0));
   CHECK(slave.snapshot().offset == Point(1920, 0));
 
@@ -169,19 +334,19 @@ void testSession() {
   // Hitting the right edge hands the pointer to the slave.
   CHECK(master.onMouseMove({1919, 500}));
   CHECK(master.snapshot().remote && cursor.hidden && cursor.pos == Point(960, 540));
-  deliver(masterNet, slave, now);
+  deliver(r.masterNet, slave, now);
   CHECK(!injector.moves.empty() && injector.moves.back() == Point(0, 500));
 
   // Relative motion from the park point moves the slave cursor.
   CHECK(master.onMouseMove({1060, 590}));
-  deliver(masterNet, slave, now);
+  deliver(r.masterNet, slave, now);
   CHECK(injector.moves.back() == Point(100, 550));
 
   // Click and wheel are forwarded (duplicates dropped by sequence number).
   CHECK(master.onMouseButton(proto::kButtonLeft, true));
   CHECK(master.onMouseButton(proto::kButtonLeft, false));
   CHECK(master.onMouseWheel(-120, false));
-  deliver(masterNet, slave, now);
+  deliver(r.masterNet, slave, now);
   CHECK(injector.buttons.size() == 2 && injector.buttons[0].second && !injector.buttons[1].second);
   CHECK(injector.wheels.size() == 1 && injector.wheels[0] == -120);
 
@@ -190,12 +355,12 @@ void testSession() {
   CHECK(master.onMouseMove({960 - 500, 540}));
   CHECK(master.snapshot().remote);
   CHECK(master.onMouseButton(proto::kButtonRight, false));
-  deliver(masterNet, slave, now);
+  deliver(r.masterNet, slave, now);
 
   // Moving back across the edge returns to the master and releases the slave.
   CHECK(master.onMouseMove({960 - 30, 540}));
   CHECK(!master.snapshot().remote && !cursor.hidden && cursor.pos == Point(1890, 550));
-  deliver(masterNet, slave, now);
+  deliver(r.masterNet, slave, now);
   CHECK(!slave.snapshot().active);
 
   // Edge crossing is refused while a button is held locally (e.g. dragging a window).
@@ -209,18 +374,134 @@ void testSession() {
   master.tick(now);
   CHECK(!master.snapshot().remote && cursor.pos == Point(1919, 300));
 
-  // Rearranging: overlapping the master is refused, a free position is accepted.
+  // It comes back with the same session; rearranging: overlap refused, free position accepted.
   slave.tick(now);
-  deliver(slaveNet, master, now);
+  deliver(r.slaveNet, master, now);
+  CHECK(master.snapshot().slaves[0].connected);
   CHECK(!master.setSlaveOffset(2, {1000, 0}));
   CHECK(master.setSlaveOffset(2, {-2560, 0}));
   master.tick(now + 1);
-  deliver(masterNet, slave, now);
+  deliver(r.masterNet, slave, now);
   CHECK(slave.snapshot().offset == Point(-2560, 0));
   CHECK(master.onMouseMove({0, 100}));  // left edge now leads to the slave
+}
 
-  std::filesystem::remove(dir / "nm_test_master.ini");
-  std::filesystem::remove(dir / "nm_test_slave.ini");
+void testKeyboardSession() {
+  Rig r("keyboard", {0, 0, 1920, 1080});
+  r.connect();
+  MasterEngine& master = *r.master;
+  SlaveEngine& slave = *r.slave;
+  FakeInjector& injector = r.injector;
+  uint64_t& now = r.now;
+
+  constexpr uint16_t A = 30, S = 31, SHIFT = 42, CTRL = 29, ALT = 56, HOME = 102;
+  // Pointer on the master: keys stay local.
+  CHECK(!master.onKey(A, 1) && !master.onKey(A, 0));
+
+  // Shift pressed locally, then the pointer crosses: the Shift release must stay local.
+  CHECK(!master.onKey(SHIFT, 1));
+  CHECK(master.onMouseMove({1919, 500}));
+  CHECK(master.onKey(A, 1) && master.onKey(A, 2) && master.onKey(A, 0));
+  CHECK(!master.onKey(SHIFT, 0));
+  deliver(r.masterNet, slave, now);
+  CHECK((injector.keys == KeyEvents{{A, 1}, {A, 2}, {A, 0}}));
+
+  // Ctrl pressed on the slave, pointer comes back: the slave releases it, the late release still
+  // goes to the slave (where it is ignored), never to the master.
+  injector.keys.clear();
+  CHECK(master.onKey(CTRL, 1));
+  CHECK(master.onMouseMove({960 - 100, 540}));  // back to the master
+  CHECK(!master.snapshot().remote);
+  CHECK(master.onKey(CTRL, 0));
+  deliver(r.masterNet, slave, now);
+  CHECK((injector.keys == KeyEvents{{CTRL, 1}, {CTRL, 0}}));
+
+  // A lost release is repaired by the next heartbeat's key set.
+  injector.keys.clear();
+  CHECK(master.onMouseMove({1919, 500}));
+  CHECK(master.onKey(S, 1));
+  deliver(r.masterNet, slave, now);
+  CHECK(master.onKey(S, 0));
+  r.masterNet.sent.clear();  // the release never arrives
+  now += 200;
+  master.tick(now);  // heartbeat
+  deliver(r.masterNet, slave, now);
+  CHECK((injector.keys == KeyEvents{{S, 1}, {S, 0}}));
+
+  // Ctrl+Alt+Home while on the slave returns the pointer; Home itself is not sent.
+  injector.keys.clear();
+  CHECK(master.onKey(CTRL, 1) && master.onKey(ALT, 1));
+  CHECK(master.onKey(HOME, 1));
+  CHECK(!master.snapshot().remote);
+  deliver(r.masterNet, slave, now);
+  for (const auto& [code, value] : injector.keys) CHECK(code != HOME);
+  CHECK(!injector.keys.empty() && injector.keys.back().second == 0);  // Leave released Ctrl/Alt
+}
+
+// Attacks: another master, replayed traffic after a restart, a slave impersonated with another key.
+void testSecurity() {
+  Rig r("security", {0, 0, 1920, 1080});
+  r.connect();
+  uint64_t& now = r.now;
+
+  // Record a session's traffic (a pointer move onto the slave), then restart the master.
+  CHECK(r.master->onMouseMove({1919, 500}));
+  CHECK(r.master->onKey(30, 1));
+  const auto recorded = r.masterNet.sent;
+  deliver(r.masterNet, *r.slave, now);
+  CHECK(r.master->onKey(30, 0));
+  CHECK(r.master->onMouseMove({960 - 100, 540}));
+  deliver(r.masterNet, *r.slave, now);
+
+  r.master = std::make_unique<MasterEngine>(MasterEngine::Options{1, "master", true, r.masterIdentity}, r.masterCfg,
+                                            r.masterNet, r.masterDisplays, r.cursor);
+  now += 1000;  // the slave's next hello
+  r.discover();
+  r.handshake();
+  CHECK(r.master->snapshot().slaves[0].connected);  // remembered across the restart, new session
+
+  // Replaying the recorded packets does nothing: they belong to the old session.
+  r.injector = FakeInjector{};
+  for (const auto& bytes : recorded) {
+    auto p = proto::decode(bytes.data(), bytes.size());
+    if (p) r.slave->onPacket(*p, 0x0A000002, now);
+  }
+  CHECK(r.injector.moves.empty() && r.injector.keys.empty());
+
+  // Another master cannot take the slave over.
+  Config rogueCfg;
+  rogueCfg.load(tempFile("nm_test_rogue.ini"));
+  FakeTransport rogueNet;
+  FakeCursor rogueCursor;
+  MasterEngine rogue({3, "rogue", true, crypto::generateIdentity()}, rogueCfg, rogueNet, r.masterDisplays,
+                     rogueCursor);
+  rogue.tick(now);
+  deliver(rogueNet, *r.slave, now);  // its announcement
+  r.slave->tick(now + 1000);
+  deliver(r.slaveNet, rogue, now);
+  CHECK(!rogue.pairSlave(2));  // the hello says the slave belongs to another master
+  CHECK(rogue.snapshot().slaves[0].otherMaster);
+
+  // Forgetting the master on the slave allows another one to connect it.
+  r.slave->forgetMaster();
+  deliver(r.slaveNet, rogue, now);
+  CHECK(rogue.pairSlave(2));
+  for (int i = 0; i < 3; ++i) {
+    deliver(rogueNet, *r.slave, now);
+    deliver(r.slaveNet, rogue, now);
+  }
+  CHECK(r.slave->snapshot().masterId == 3 && rogue.snapshot().slaves[0].connected);
+  fs::remove(tempFile("nm_test_rogue.ini"));
+
+  // A PC announcing itself as a paired slave but with another key is not trusted.
+  proto::Packet fake;
+  fake.sender = 2;
+  proto::SlaveHello h{"slave", {{0, 0, 1920, 1080}}, 1, 0, 0};
+  h.publicKey = crypto::generateIdentity().publicKey;
+  fake.body = h;
+  r.master->onPacket(fake, 0x0A000009, now + 2000);
+  const auto view = r.master->snapshot().slaves[0];
+  CHECK(view.keyMismatch && !view.connected);
 }
 
 // A slave with two network cards announces itself from both; the master must keep the address that
@@ -230,12 +511,12 @@ void testMultiHomedSlave() {
     bool isLocalSubnet(uint32_t ip) const override { return (ip >> 24) == 10; }
   };
   Config cfg;
-  cfg.load(std::filesystem::temp_directory_path() / "nm_test_multihomed.ini");
+  cfg.load(tempFile("nm_test_multihomed.ini"));
   SubnetTransport net;
   FakeDisplays displays;
   displays.list = {{{0, 0, 1920, 1080}, true, "M1"}};
   FakeCursor cursor;
-  MasterEngine master({1, "master", true}, cfg, net, displays, cursor);
+  MasterEngine master({1, "master", true, crypto::generateIdentity()}, cfg, net, displays, cursor);
 
   proto::Packet hello;
   hello.sender = 7;
@@ -263,132 +544,23 @@ void testMultiHomedSlave() {
   std::get<proto::SlaveHello>(hello.body).address = reachable;
   master.onPacket(hello, other, 1007);
   CHECK(master.snapshot().slaves[2].ip == reachable);
-  std::filesystem::remove(std::filesystem::temp_directory_path() / "nm_test_multihomed.ini");
-}
-
-void testKeymap() {
-  using namespace keymap;
-  CHECK(fromWindows(0x41, 0x1E, false) == 30);   // A
-  CHECK(fromWindows(0x7B, 0x58, false) == 88);   // F12
-  CHECK(fromWindows(0xA3, 0x1D, true) == 97);    // Right Ctrl
-  CHECK(fromWindows(0x26, 0x48, true) == 103);   // Up
-  CHECK(fromWindows(0x13, 0x45, false) == 119);  // Pause
-  CHECK(fromWindows(0x90, 0x45, true) == 69);    // NumLock (reported as extended)
-  CHECK(fromWindows(0xA2, 0x21D, false) == 0);   // fake Left Ctrl sent with AltGr
-  CHECK(fromWindows(0xAF, 0, false) == 115);     // Volume Up without a scan code
-  WinKey wk;
-  CHECK(toWindows(30, wk) && wk.scan == 0x1E && !wk.extended && wk.vk == 0);
-  CHECK(toWindows(103, wk) && wk.scan == 0x48 && wk.extended);
-  CHECK(toWindows(119, wk) && wk.vk == 0x13);
-  CHECK(toWindows(69, wk) && wk.vk == 0x90 && wk.extended);
-  // Every key Windows can report survives the round trip to an injectable key.
-  for (uint32_t scan = 1; scan <= 0x58; ++scan) {
-    const uint16_t code = fromWindows(0, scan, false);
-    if (code) CHECK(toWindows(code, wk));
-  }
-}
-
-void testKeyProtocol() {
-  proto::Packet p;
-  p.sender = 5;
-  p.seq = 9;
-  proto::KeySet held;
-  held.set(29, true);
-  held.set(30, true);
-  p.body = proto::Key{77, 30, 1, held};
-  auto bytes = proto::encode(p);
-  auto d = proto::decode(bytes.data(), bytes.size());
-  const auto* k = d ? std::get_if<proto::Key>(&d->body) : nullptr;
-  CHECK(k && k->target == 77 && k->code == 30 && k->value == 1 && k->held.has(29) && k->held.has(30) &&
-        !k->held.has(31));
-
-  p.body = proto::Pointer{77, {1, 2}, 0, 0, 0, true, held};
-  bytes = proto::encode(p);
-  d = proto::decode(bytes.data(), bytes.size());
-  const auto* ptr = d ? std::get_if<proto::Pointer>(&d->body) : nullptr;
-  CHECK(ptr && ptr->hasKeys && ptr->keys == held);
-  // A pointer from an older master (no key set) still decodes, without keys.
-  d = proto::decode(bytes.data(), bytes.size() - sizeof(proto::KeySet::bits));
-  ptr = d ? std::get_if<proto::Pointer>(&d->body) : nullptr;
-  CHECK(ptr && !ptr->hasKeys);
-}
-
-void testKeyboardSession() {
-  auto dir = std::filesystem::temp_directory_path();
-  Config masterCfg, slaveCfg;
-  masterCfg.load(dir / "nm_test_kb_master.ini");
-  slaveCfg.load(dir / "nm_test_kb_slave.ini");
-  FakeTransport masterNet, slaveNet;
-  FakeDisplays masterDisplays, slaveDisplays;
-  masterDisplays.list = {{{0, 0, 1920, 1080}, true, "M1"}};
-  slaveDisplays.list = {{{0, 0, 1920, 1080}, true, "S1"}};
-  FakeCursor cursor;
-  FakeInjector injector;
-  MasterEngine master({1, "master", true}, masterCfg, masterNet, masterDisplays, cursor);
-  SlaveEngine slave({2, "slave"}, slaveCfg, slaveNet, slaveDisplays, injector);
-  uint64_t now = 10'000;
-  slave.tick(now);
-  deliver(slaveNet, master, now);
-  deliver(masterNet, slave, now);
-  deliver(slaveNet, master, now);
-
-  constexpr uint16_t A = 30, S = 31, SHIFT = 42, CTRL = 29, ALT = 56, HOME = 102;
-  // Pointer on the master: keys stay local.
-  CHECK(!master.onKey(A, 1) && !master.onKey(A, 0));
-
-  // Shift pressed locally, then the pointer crosses: the Shift release must stay local.
-  CHECK(!master.onKey(SHIFT, 1));
-  CHECK(master.onMouseMove({1919, 500}));
-  CHECK(master.onKey(A, 1) && master.onKey(A, 2) && master.onKey(A, 0));
-  CHECK(!master.onKey(SHIFT, 0));
-  deliver(masterNet, slave, now);
-  CHECK((injector.keys == std::vector<std::pair<uint16_t, int>>{{A, 1}, {A, 2}, {A, 0}}));
-
-  // Ctrl pressed on the slave, pointer comes back: the slave releases it, the late release still
-  // goes to the slave (where it is ignored), never to the master.
-  injector.keys.clear();
-  CHECK(master.onKey(CTRL, 1));
-  CHECK(master.onMouseMove({960 - 100, 540}));  // back to the master
-  CHECK(!master.snapshot().remote);
-  CHECK(master.onKey(CTRL, 0));
-  deliver(masterNet, slave, now);
-  CHECK((injector.keys == std::vector<std::pair<uint16_t, int>>{{CTRL, 1}, {CTRL, 0}}));
-
-  // A lost release is repaired by the next heartbeat's key set.
-  injector.keys.clear();
-  CHECK(master.onMouseMove({1919, 500}));
-  CHECK(master.onKey(S, 1));
-  deliver(masterNet, slave, now);
-  CHECK(master.onKey(S, 0));
-  masterNet.sent.clear();  // the release never arrives
-  now += 200;
-  master.tick(now);  // heartbeat
-  deliver(masterNet, slave, now);
-  CHECK((injector.keys == std::vector<std::pair<uint16_t, int>>{{S, 1}, {S, 0}}));
-
-  // Ctrl+Alt+Home while on the slave returns the pointer; Home itself is not sent.
-  injector.keys.clear();
-  CHECK(master.onKey(CTRL, 1) && master.onKey(ALT, 1));
-  CHECK(master.onKey(HOME, 1));
-  CHECK(!master.snapshot().remote);
-  deliver(masterNet, slave, now);
-  for (const auto& [code, value] : injector.keys) CHECK(code != HOME);
-  CHECK(!injector.keys.empty() && injector.keys.back().second == 0);  // Leave released Ctrl/Alt
-  std::filesystem::remove(dir / "nm_test_kb_master.ini");
-  std::filesystem::remove(dir / "nm_test_kb_slave.ini");
+  fs::remove(tempFile("nm_test_multihomed.ini"));
 }
 
 }  // namespace
 
 int main() {
+  testCrypto();
   testProtocol();
+  testKeyProtocol();
   testLayout();
   testConfig();
-  testSession();
-  testMultiHomedSlave();
   testKeymap();
-  testKeyProtocol();
+  testPairing();
+  testSession();
   testKeyboardSession();
+  testSecurity();
+  testMultiHomedSlave();
   if (g_failures == 0) std::printf("All tests passed\n");
   return g_failures == 0 ? 0 : 1;
 }

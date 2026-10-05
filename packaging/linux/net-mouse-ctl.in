@@ -4,8 +4,10 @@
 #   net-mouse-ctl role [master|slave]    show or change the role (restarts the service)
 #   net-mouse-ctl monitors [SPEC|auto]   show or set this PC's monitor layout, e.g. 1920x1080+0+0,2560x1440+1920+0
 #   net-mouse-ctl status                 service state and what the daemon sees
+#   net-mouse-ctl fingerprint            this PC's key fingerprint (compare it when connecting)
+#   net-mouse-ctl forget-master          slave: drop the paired master so another one can connect it
 #   net-mouse-ctl logs                   follow the service log
-#   net-mouse-ctl gui                    open the settings window (screen arrangement)
+#   net-mouse-ctl gui                    open the settings window (screen arrangement, connecting PCs)
 #   net-mouse-ctl setup [ROLE]           used by 'make install': uinput, firewall, enable + start
 #   net-mouse-ctl remove                 used by 'make uninstall': stop + disable, firewall
 set -eu
@@ -100,6 +102,17 @@ case "$cmd" in
     fi
     ;;
 
+  fingerprint)
+    reply=$("$DAEMON" --query status) || die "the service is not running"
+    # The first "fingerprint" in the status is this PC's own (the master's/slaves' come later).
+    echo "$reply" | grep -o '"fingerprint":"[0-9A-F-]*"' | head -n 1 | cut -d '"' -f 4
+    ;;
+
+  forget-master)
+    as_root forget-master "$@"
+    "$DAEMON" --query forget-master
+    ;;
+
   logs)
     exec journalctl -u "$SERVICE" -f
     ;;
@@ -137,10 +150,10 @@ case "$cmd" in
     ;;
 
   -h|--help|help)
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 
   *)
-    die "unknown command '$cmd' (role, monitors, status, logs, gui, setup, remove)"
+    die "unknown command '$cmd' (role, monitors, status, fingerprint, forget-master, logs, gui, setup, remove)"
     ;;
 esac

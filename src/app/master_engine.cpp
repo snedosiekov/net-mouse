@@ -15,7 +15,7 @@ constexpr uint64_t kMonitorRefreshMs = 1000;
 constexpr uint64_t kSlaveTimeoutMs = 3500;
 constexpr uint64_t kConfigRetryMs = 500;
 constexpr uint64_t kHeartbeatMs = 100;
-// Button and wheel packets are sent twice; the slave drops the duplicate by sequence number.
+// Button, wheel and key packets are sent twice; the slave drops the duplicate by sequence number.
 constexpr int kReliableRepeats = 2;
 
 uint32_t randomU32() {
@@ -192,25 +192,32 @@ void MasterEngine::leaveRemoteLocked(Point at) {
   ++changes_;
 }
 
-void MasterEngine::sendPointerLocked(int16_t wheelV, int16_t wheelH, int repeats) {
+// Everything that controls a slave is sealed with its session key; without a session nothing is sent.
+bool MasterEngine::sendSealedLocked(uint64_t slaveId, proto::Body body, int repeats) {
+  const Slave* s = findSlaveLocked(slaveId);
+  if (!s || !s->hasSession) return false;
   proto::Packet p;
   p.sender = options_.id;
   p.seq = ++seq_;
-  p.body = proto::Pointer{target_, virtual_, remoteButtons_, wheelV, wheelH, true, keysOfLocked(target_)};
-  const auto bytes = proto::encode(p);
-  const uint32_t ip = targetIpLocked();
-  for (int i = 0; i < repeats; ++i) transport_.send(bytes, ip);
+  p.body = std::move(body);
+  const auto bytes = proto::seal(p, slaveId, proto::KeyKind::Session, s->sessionKey);
+  for (int i = 0; i < repeats; ++i) transport_.send(bytes, s->ip);
+  return true;
+}
+
+void MasterEngine::sendPointerLocked(int16_t wheelV, int16_t wheelH, int repeats) {
+  sendSealedLocked(target_, proto::Pointer{target_, virtual_, remoteButtons_, wheelV, wheelH, keysOfLocked(target_)},
+                   repeats);
 }
 
 void MasterEngine::sendKeyLocked(uint64_t slaveId, uint16_t code, int value) {
-  proto::Packet p;
-  p.sender = options_.id;
-  p.seq = ++seq_;
-  p.body = proto::Key{slaveId, code, static_cast<uint8_t>(value), keysOfLocked(slaveId)};
-  const auto bytes = proto::encode(p);
-  const uint32_t ip = slaveIpLocked(slaveId);
   // Presses and releases are sent twice (duplicates are dropped by sequence number); repeats once.
-  for (int i = 0; i < (value == 2 ? 1 : kReliableRepeats); ++i) transport_.send(bytes, ip);
+  sendSealedLocked(slaveId, proto::Key{slaveId, code, static_cast<uint8_t>(value), keysOfLocked(slaveId)},
+                   value == 2 ? 1 : kReliableRepeats);
+}
+
+void MasterEngine::sendLeaveLocked() {
+  if (target_ != 0) sendSealedLocked(target_, proto::Leave{target_}, kReliableRepeats);
 }
 
 proto::KeySet MasterEngine::keysOfLocked(uint64_t owner) const {
@@ -220,24 +227,6 @@ proto::KeySet MasterEngine::keysOfLocked(uint64_t owner) const {
   }
   return keys;
 }
-
-uint32_t MasterEngine::slaveIpLocked(uint64_t slaveId) {
-  const Slave* s = findSlaveLocked(slaveId);
-  return s ? s->ip : kRouteDefault;
-}
-
-void MasterEngine::sendLeaveLocked() {
-  if (target_ == 0) return;
-  proto::Packet p;
-  p.sender = options_.id;
-  p.seq = ++seq_;
-  p.body = proto::Leave{target_};
-  const auto bytes = proto::encode(p);
-  const uint32_t ip = targetIpLocked();
-  for (int i = 0; i < kReliableRepeats; ++i) transport_.send(bytes, ip);
-}
-
-uint32_t MasterEngine::targetIpLocked() { return slaveIpLocked(target_); }
 
 Point MasterEngine::parkPointLocked() const {
   for (const MonitorInfo& m : monitors_) {
@@ -252,6 +241,7 @@ Point MasterEngine::parkPointLocked() const {
 void MasterEngine::onPacket(const proto::Packet& packet, uint32_t sourceIp, uint64_t nowMs) {
   if (packet.sender == options_.id) return;
   std::lock_guard lock(mutex_);
+  nowMs_ = nowMs;
   if (const auto* hello = std::get_if<proto::SlaveHello>(&packet.body)) {
     handleHelloLocked(*hello, packet.sender, sourceIp, nowMs);
   } else if (const auto* announce = std::get_if<proto::MasterAnnounce>(&packet.body)) {
@@ -260,6 +250,7 @@ void MasterEngine::onPacket(const proto::Packet& packet, uint32_t sourceIp, uint
                          toHex(packet.sender).c_str()));
     }
   }
+  // Sealed packets are addressed to slaves; a master never accepts any.
 }
 
 void MasterEngine::handleHelloLocked(const proto::SlaveHello& hello, uint64_t sender, uint32_t ip,
@@ -271,6 +262,10 @@ void MasterEngine::handleHelloLocked(const proto::SlaveHello& hello, uint64_t se
     Slave fresh;
     fresh.id = sender;
     fresh.version = allocVersionLocked();
+    if (crypto::fromHex(config_.get(slaveKey(sender, "key")), fresh.pinnedKey.data(), fresh.pinnedKey.size())) {
+      fresh.paired = true;
+      fresh.pairKey = crypto::pairKey(options_.identity, fresh.pinnedKey, true);
+    }
     slaves_.push_back(std::move(fresh));
     s = &slaves_.back();
   }
@@ -292,30 +287,102 @@ void MasterEngine::handleHelloLocked(const proto::SlaveHello& hello, uint64_t se
     s->monitors = hello.monitors;
     topologyChanged = true;
   }
+  s->announcedKey = hello.publicKey;
+  s->fingerprint = crypto::fingerprint(hello.publicKey);
+  s->slaveNonce = hello.sessionNonce;
+  const bool otherMaster = hello.masterId != 0 && hello.masterId != options_.id;
+  if (otherMaster != s->otherMaster) {
+    s->otherMaster = otherMaster;
+    ++changes_;
+  }
   if (!s->online) {
     s->online = true;
     topologyChanged = true;
-    if (config_.has(slaveKey(s->id, "x"))) {
-      s->offset = {static_cast<int32_t>(config_.getInt(slaveKey(s->id, "x"))),
-                   static_cast<int32_t>(config_.getInt(slaveKey(s->id, "y")))};
-    } else {
-      placeNewSlaveLocked(*s);
+    log::info(s->paired ? log::fmt("Slave '%s' online at %s", s->name.c_str(), ipToString(s->ip).c_str())
+                        : log::fmt("Found PC '%s' at %s (not connected, fingerprint %s)", s->name.c_str(),
+                                   ipToString(s->ip).c_str(), s->fingerprint.c_str()));
+  }
+
+  if (s->paired) {
+    const bool mismatch = hello.publicKey != s->pinnedKey;
+    if (mismatch != s->keyMismatch) {
+      s->keyMismatch = mismatch;
+      ++changes_;
+      if (mismatch) {
+        log::info(log::fmt("Warning: '%s' announces a different key (fingerprint %s); it stays disconnected "
+                           "until it is connected again",
+                           s->name.c_str(), s->fingerprint.c_str()));
+      }
     }
-    log::info(log::fmt("Slave '%s' online at %s", s->name.c_str(), ipToString(ip).c_str()));
+    if (mismatch) {
+      setConnectedLocked(*s, false);
+    } else {
+      if (!s->placed) {
+        ensurePlacedLocked(*s);
+        topologyChanged = true;
+      }
+      // The hello is only trusted if the slave keyed it with our pair key.
+      const auto auth = proto::helloAuthData(sender, hello);
+      const bool authentic = hello.masterId == options_.id &&
+                             crypto::macEquals(crypto::mac(s->pairKey, auth.data(), auth.size()), hello.mac);
+      if (authentic && s->hasSession && hello.sessionId == s->sessionId) {
+        setConnectedLocked(*s, true);
+        const bool synced = hello.configVersion == s->version;
+        if (synced != s->synced) {
+          s->synced = synced;
+          ++changes_;
+        }
+        if (!synced && (s->configDue || nowMs - s->lastConfigSentMs >= kConfigRetryMs)) sendConfigLocked(*s, nowMs);
+      } else {
+        setConnectedLocked(*s, false);
+        // New session when the slave trusts us (authentic) or nobody yet (first pairing).
+        if ((authentic || hello.masterId == 0) && nowMs - s->lastSessionInitMs >= kConfigRetryMs) {
+          startSessionLocked(*s, nowMs);
+        }
+      }
+    }
   }
-  const bool synced = hello.masterId == options_.id && hello.configVersion == s->version;
-  if (synced != s->synced) {
-    s->synced = synced;
-    ++changes_;
-  }
-  if (!synced && (s->configDue || nowMs - s->lastConfigSentMs >= kConfigRetryMs)) sendConfigLocked(*s, nowMs);
   if (topologyChanged) {
     rebuildScreensLocked();
     ++changes_;
   }
 }
 
-void MasterEngine::placeNewSlaveLocked(Slave& s) {
+void MasterEngine::setConnectedLocked(Slave& s, bool connected) {
+  if (s.connected == connected) return;
+  s.connected = connected;
+  if (connected) {
+    log::info("Slave '" + s.name + "' connected (encrypted session)");
+  } else {
+    s.synced = false;
+    s.configDue = true;
+  }
+  rebuildScreensLocked();
+  ++changes_;
+}
+
+void MasterEngine::startSessionLocked(Slave& s, uint64_t nowMs) {
+  const auto masterNonce = crypto::randomArray<crypto::Nonce16>();
+  s.sessionKey = crypto::sessionKey(s.pairKey, masterNonce, s.slaveNonce);
+  s.sessionId = crypto::keyId(s.sessionKey);
+  s.hasSession = true;
+  s.lastSessionInitMs = nowMs;
+  s.configDue = true;
+  proto::Packet p;
+  p.sender = options_.id;
+  p.seq = ++seq_;
+  p.body = proto::SessionInit{s.id, masterNonce, s.slaveNonce};
+  transport_.send(proto::seal(p, s.id, proto::KeyKind::Pair, s.pairKey), s.ip);
+}
+
+void MasterEngine::ensurePlacedLocked(Slave& s) {
+  if (s.placed || s.monitors.empty()) return;
+  s.placed = true;
+  if (config_.has(slaveKey(s.id, "x"))) {
+    s.offset = {static_cast<int32_t>(config_.getInt(slaveKey(s.id, "x"))),
+                static_cast<int32_t>(config_.getInt(slaveKey(s.id, "y")))};
+    return;
+  }
   std::vector<Rect> occupied;
   Rect primary;
   for (const MonitorInfo& m : monitors_) {
@@ -324,26 +391,24 @@ void MasterEngine::placeNewSlaveLocked(Slave& s) {
   }
   if (primary.empty() && !monitors_.empty()) primary = monitors_.front().rect;
   for (const Slave& other : slaves_) {
-    if (other.id == s.id || !other.online) continue;
+    if (other.id == s.id || !other.placed || !other.online) continue;
     for (const Rect& r : other.monitors) occupied.push_back(r.translated(other.offset));
   }
   s.offset = layout::autoPlace(occupied, primary, boundingRect(s.monitors));
   saveSlaveLocked(s);
-  log::info(log::fmt("Placed new slave '%s' to the right at (%d, %d)", s.name.c_str(), s.offset.x, s.offset.y));
+  log::info(log::fmt("Placed slave '%s' to the right at (%d, %d)", s.name.c_str(), s.offset.x, s.offset.y));
 }
 
 void MasterEngine::sendConfigLocked(Slave& s, uint64_t nowMs) {
-  proto::Packet p;
-  p.sender = options_.id;
-  p.seq = ++seq_;
-  p.body = proto::SlaveConfig{s.id, s.version, s.offset};
-  transport_.send(proto::encode(p), s.ip);
-  s.lastConfigSentMs = nowMs;
-  s.configDue = false;
+  if (sendSealedLocked(s.id, proto::SlaveConfig{s.id, s.version, s.offset}, 1)) {
+    s.lastConfigSentMs = nowMs;
+    s.configDue = false;
+  }
 }
 
 void MasterEngine::tick(uint64_t nowMs) {
   std::lock_guard lock(mutex_);
+  nowMs_ = nowMs;
   if (nowMs - lastMonitorRefreshMs_ >= kMonitorRefreshMs) {
     lastMonitorRefreshMs_ = nowMs;
     refreshMonitorsLocked();
@@ -354,32 +419,27 @@ void MasterEngine::tick(uint64_t nowMs) {
     proto::Packet p;
     p.sender = options_.id;
     p.seq = ++seq_;
-    p.body = proto::MasterAnnounce{options_.name};
+    p.body = proto::MasterAnnounce{options_.name, options_.identity.publicKey};
     transport_.send(proto::encode(p), kRouteAllInterfaces);
   }
 
-  bool topologyChanged = false;
   for (Slave& s : slaves_) {
     if (s.online && nowMs - s.lastSeenMs > kSlaveTimeoutMs) {
       s.online = false;
-      s.synced = false;
-      s.configDue = true;
-      topologyChanged = true;
+      setConnectedLocked(s, false);
+      rebuildScreensLocked();
+      ++changes_;
       log::info("Slave '" + s.name + "' went offline");
     }
-    if (s.online && !s.synced && (s.configDue || nowMs - s.lastConfigSentMs >= kConfigRetryMs)) {
+    if (s.connected && !s.synced && (s.configDue || nowMs - s.lastConfigSentMs >= kConfigRetryMs)) {
       sendConfigLocked(s, nowMs);
     }
-  }
-  if (topologyChanged) {
-    rebuildScreensLocked();
-    ++changes_;
   }
 
   if (remote_) {
     const layout::Screen* s = layout::screenAt(screens_, virtual_);
     if (!s || s->owner != target_) {
-      leaveRemoteLocked(returnPoint_);  // slave vanished or the layout changed under the pointer
+      leaveRemoteLocked(returnPoint_);  // slave vanished, disconnected, or the layout changed under the pointer
     } else if (nowMs - lastHeartbeatMs_ >= kHeartbeatMs) {
       lastHeartbeatMs_ = nowMs;
       sendPointerLocked(0, 0, 1);  // lets the slave resync after packet loss
@@ -398,30 +458,68 @@ MasterSnapshot MasterEngine::snapshot() const {
   snap.remote = remote_;
   snap.activeSlave = target_;
   snap.virtualPos = virtual_;
+  snap.fingerprint = crypto::fingerprint(options_.identity.publicKey);
   return snap;
 }
 
 bool MasterEngine::setSlaveOffset(uint64_t slaveId, Point offset) {
   std::lock_guard lock(mutex_);
   Slave* s = findSlaveLocked(slaveId);
-  if (!s) return false;
+  if (!s || !s->paired) return false;
   std::vector<Rect> moved;
   for (const Rect& r : s->monitors) moved.push_back(r.translated(offset));
   std::vector<Rect> others;
   for (const MonitorInfo& m : monitors_) others.push_back(m.rect);
   for (const Slave& o : slaves_) {
-    if (o.id == slaveId || !o.online) continue;
+    if (o.id == slaveId || !o.online || !o.paired) continue;
     for (const Rect& r : o.monitors) others.push_back(r.translated(o.offset));
   }
   if (layout::overlapsAny(moved, others)) return false;
   if (s->offset == offset) return true;
   s->offset = offset;
+  s->placed = true;
   s->version = allocVersionLocked();
   s->synced = false;
   s->configDue = true;
   saveSlaveLocked(*s);
   rebuildScreensLocked();
   log::info(log::fmt("Slave '%s' moved to (%d, %d)", s->name.c_str(), offset.x, offset.y));
+  ++changes_;
+  return true;
+}
+
+bool MasterEngine::pairSlave(uint64_t slaveId) {
+  std::lock_guard lock(mutex_);
+  Slave* s = findSlaveLocked(slaveId);
+  if (!s || !s->online || s->otherMaster) return false;
+  s->pinnedKey = s->announcedKey;
+  s->paired = true;
+  s->keyMismatch = false;
+  s->pairKey = crypto::pairKey(options_.identity, s->pinnedKey, true);
+  s->hasSession = false;
+  config_.set(slaveKey(s->id, "key"), crypto::toHex(s->pinnedKey.data(), s->pinnedKey.size()));
+  ensurePlacedLocked(*s);
+  saveSlaveLocked(*s);
+  log::info(log::fmt("Connected '%s' (fingerprint %s)", s->name.c_str(), s->fingerprint.c_str()));
+  startSessionLocked(*s, nowMs_);
+  rebuildScreensLocked();
+  ++changes_;
+  return true;
+}
+
+bool MasterEngine::unpairSlave(uint64_t slaveId) {
+  std::lock_guard lock(mutex_);
+  Slave* s = findSlaveLocked(slaveId);
+  if (!s || !s->paired) return false;
+  if (remote_ && target_ == slaveId) leaveRemoteLocked(returnPoint_);
+  s->paired = false;
+  s->hasSession = false;
+  s->keyMismatch = false;
+  setConnectedLocked(*s, false);
+  config_.erase(slaveKey(s->id, "key"));  // its position is kept for a later reconnect
+  if (!config_.save()) log::info("Failed to save " + config_.path().string());
+  log::info("Disconnected '" + s->name + "'");
+  rebuildScreensLocked();
   ++changes_;
   return true;
 }
@@ -442,7 +540,7 @@ void MasterEngine::rebuildScreensLocked() {
   screens_.clear();
   for (const MonitorInfo& m : monitors_) screens_.push_back({m.rect, layout::kMasterOwner});
   for (const Slave& s : slaves_) {
-    if (!s.online) continue;
+    if (!s.online || !s.connected) continue;  // the pointer only goes to connected (encrypted) slaves
     for (const Rect& r : s.monitors) screens_.push_back({r.translated(s.offset), s.id});
   }
 }

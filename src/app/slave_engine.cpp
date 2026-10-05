@@ -1,6 +1,5 @@
 #include "app/slave_engine.h"
 
-
 #include "core/log.h"
 #include "core/udp.h"
 
@@ -12,8 +11,7 @@ constexpr uint64_t kMonitorRefreshMs = 1000;
 constexpr uint64_t kMasterTimeoutMs = 3500;
 // The master sends a heartbeat every 100 ms while the pointer is here.
 constexpr uint64_t kPointerTimeoutMs = 1500;
-// A sequence number this far behind the last one means the master restarted.
-constexpr int32_t kSeqRestartWindow = 1000;
+constexpr size_t kMaxAnnouncedMasters = 32;
 
 constexpr uint8_t kAllButtons[] = {proto::kButtonLeft, proto::kButtonRight, proto::kButtonMiddle,
                                    proto::kButtonX1, proto::kButtonX2};
@@ -29,81 +27,147 @@ SlaveEngine::SlaveEngine(Options options, Config& config, ITransport& transport,
       injector_(injector) {
   std::lock_guard lock(mutex_);
   monitors_ = displays_.monitors();
+  sessionNonce_ = crypto::randomArray<crypto::Nonce16>();
   masterId_ = config_.getHex("master_id");
-  configVersion_ = static_cast<uint32_t>(config_.getInt("config_version"));
-  offset_ = {static_cast<int32_t>(config_.getInt("offset_x")), static_cast<int32_t>(config_.getInt("offset_y"))};
-  masterName_ = config_.get("master_name");
+  if (masterId_ != 0 && crypto::fromHex(config_.get("master_key"), masterKey_.data(), masterKey_.size())) {
+    hasTrusted_ = true;
+    pairKey_ = crypto::pairKey(options_.identity, masterKey_, false);
+    configVersion_ = static_cast<uint32_t>(config_.getInt("config_version"));
+    offset_ = {static_cast<int32_t>(config_.getInt("offset_x")), static_cast<int32_t>(config_.getInt("offset_y"))};
+    masterName_ = config_.get("master_name");
+  } else {
+    masterId_ = 0;  // no pinned key (e.g. settings from an unencrypted version): wait to be connected
+  }
 }
 
 void SlaveEngine::onPacket(const proto::Packet& packet, uint32_t sourceIp, uint64_t nowMs) {
   if (packet.sender == options_.id) return;
   std::lock_guard lock(mutex_);
   nowMs_ = nowMs;
-
   if (const auto* announce = std::get_if<proto::MasterAnnounce>(&packet.body)) {
-    if (packet.sender == masterId_ || masterId_ == 0) {
-      if (!masterSeen_ || masterName_ != announce->name || masterIp_ != sourceIp) ++changes_;
-      if (!masterSeen_ || nowMs - lastMasterSeenMs_ > kMasterTimeoutMs) {
-        log::info(log::fmt("Master '%s' found at %s", announce->name.c_str(), ipToString(sourceIp).c_str()));
-      }
-      if (masterId_ != 0 && masterName_ != announce->name) {
-        config_.set("master_name", announce->name);
-        config_.save();
-      }
-      masterName_ = announce->name;
-      masterIp_ = sourceIp;
-      lastMasterSeenMs_ = nowMs;
-      masterSeen_ = true;
-    }
-  } else if (const auto* cfg = std::get_if<proto::SlaveConfig>(&packet.body)) {
-    if (cfg->target != options_.id) return;
-    const bool changed = packet.sender != masterId_ || cfg->version != configVersion_ || !(cfg->offset == offset_);
-    if (packet.sender != masterId_) {
-      if (active_) deactivateLocked();
-      haveSeq_ = false;
-    }
-    masterId_ = packet.sender;
-    masterIp_ = sourceIp;
-    lastMasterSeenMs_ = nowMs;
-    masterSeen_ = true;
-    configVersion_ = cfg->version;
-    offset_ = cfg->offset;
-    if (changed) {
-      config_.setHex("master_id", masterId_);
-      config_.setInt("config_version", configVersion_);
-      config_.setInt("offset_x", offset_.x);
-      config_.setInt("offset_y", offset_.y);
-      config_.set("master_name", masterName_);
-      if (!config_.save()) log::info("Failed to save " + config_.path().string());
-      log::info(log::fmt("Configuration from master applied: desktop origin at (%d, %d) in master layout",
-                         offset_.x, offset_.y));
-      ++changes_;
-    }
-    sendHelloLocked();  // acknowledges the configuration
-  } else if (const auto* pointer = std::get_if<proto::Pointer>(&packet.body)) {
-    if (packet.sender != masterId_ || masterId_ == 0) return;
-    lastMasterSeenMs_ = nowMs;
-    if (pointer->target != options_.id) {
-      if (active_) deactivateLocked();  // the master moved on to another slave
-      return;
-    }
-    if (acceptSeqLocked(packet.seq)) handlePointerLocked(*pointer, nowMs);
-  } else if (const auto* key = std::get_if<proto::Key>(&packet.body)) {
-    if (packet.sender != masterId_ || masterId_ == 0 || key->target != options_.id) return;
-    lastMasterSeenMs_ = nowMs;
-    if (acceptSeqLocked(packet.seq)) handleKeyLocked(*key);
-  } else if (const auto* leave = std::get_if<proto::Leave>(&packet.body)) {
-    if (packet.sender == masterId_ && leave->target == options_.id && (active_ || keyHeldLocked())) {
-      deactivateLocked();
+    handleAnnounceLocked(*announce, packet.sender, sourceIp, nowMs);
+  } else if (const auto* sealed = std::get_if<proto::Sealed>(&packet.body)) {
+    if (sealed->target != options_.id) return;
+    if (sealed->kind == proto::KeyKind::Pair) {
+      handleSessionInitLocked(packet, sourceIp, nowMs);
+    } else {
+      handleSealedLocked(packet, nowMs);
     }
   }
 }
 
-bool SlaveEngine::acceptSeqLocked(uint32_t seq) {
-  if (haveSeq_) {
-    const int32_t diff = static_cast<int32_t>(seq - lastSeq_);
-    if (diff <= 0 && diff > -kSeqRestartWindow) return false;  // duplicate or reordered packet
+void SlaveEngine::handleAnnounceLocked(const proto::MasterAnnounce& a, uint64_t sender, uint32_t ip, uint64_t nowMs) {
+  if (announcedKeys_.size() >= kMaxAnnouncedMasters && !announcedKeys_.count(sender)) announcedKeys_.clear();
+  announcedKeys_[sender] = a.publicKey;
+  if (hasTrusted_ && sender != masterId_) return;
+  if (hasTrusted_ && a.publicKey != masterKey_) {
+    if (!impostorLogged_) {
+      log::info(log::fmt("Warning: a master announces itself as '%s' with a different key; ignored", a.name.c_str()));
+      impostorLogged_ = true;
+    }
+    return;
   }
+  if (!masterSeen_ || masterName_ != a.name || masterIp_ != ip) ++changes_;
+  if (!masterSeen_ || nowMs - lastMasterSeenMs_ > kMasterTimeoutMs) {
+    log::info(log::fmt("Master '%s' found at %s", a.name.c_str(), ipToString(ip).c_str()));
+  }
+  if (hasTrusted_ && masterName_ != a.name) {
+    config_.set("master_name", a.name);
+    config_.save();
+  }
+  masterName_ = a.name;
+  masterIp_ = ip;
+  lastMasterSeenMs_ = nowMs;
+  masterSeen_ = true;
+}
+
+void SlaveEngine::handleSessionInitLocked(const proto::Packet& sealed, uint32_t ip, uint64_t nowMs) {
+  crypto::Key masterKey;
+  crypto::Key pairKey;
+  if (hasTrusted_) {
+    if (sealed.sender != masterId_) {
+      if (!refusedLogged_) {
+        log::info("Refused a connection from another master: this PC is paired with '" + masterName_ +
+                  "' (forget it first to switch)");
+        refusedLogged_ = true;
+      }
+      return;
+    }
+    masterKey = masterKey_;
+    pairKey = pairKey_;
+  } else {
+    auto it = announcedKeys_.find(sealed.sender);
+    if (it == announcedKeys_.end()) return;  // its announcement (with the public key) comes first
+    masterKey = it->second;
+    pairKey = crypto::pairKey(options_.identity, masterKey, false);
+  }
+  const auto inner = proto::open(sealed, pairKey);
+  const auto* init = inner ? std::get_if<proto::SessionInit>(&inner->body) : nullptr;
+  if (!init || init->slaveNonce != sessionNonce_) return;  // forged, or an old (replayed) handshake
+
+  if (!hasTrusted_) {
+    hasTrusted_ = true;
+    masterId_ = sealed.sender;
+    masterKey_ = masterKey;
+    pairKey_ = pairKey;
+    configVersion_ = 0;
+    config_.setHex("master_id", masterId_);
+    config_.set("master_key", crypto::toHex(masterKey_.data(), masterKey_.size()));
+    config_.erase("config_version");
+    if (!config_.save()) log::info("Failed to save " + config_.path().string());
+    log::info(log::fmt("Paired with master '%s' (fingerprint %s)", masterName_.c_str(),
+                       crypto::fingerprint(masterKey_).c_str()));
+  }
+  if (active_) deactivateLocked();
+  sessionKey_ = crypto::sessionKey(pairKey_, init->masterNonce, sessionNonce_);
+  sessionId_ = crypto::keyId(sessionKey_);
+  hasSession_ = true;
+  sessionNonce_ = crypto::randomArray<crypto::Nonce16>();  // this handshake can never be accepted again
+  haveSeq_ = false;
+  masterIp_ = ip;
+  lastMasterSeenMs_ = nowMs;
+  masterSeen_ = true;
+  log::info("Encrypted session with the master established");
+  ++changes_;
+  sendHelloLocked();  // tells the master which session we use
+}
+
+void SlaveEngine::handleSealedLocked(const proto::Packet& sealed, uint64_t nowMs) {
+  if (!hasSession_ || sealed.sender != masterId_) return;
+  const auto inner = proto::open(sealed, sessionKey_);
+  if (!inner) return;  // not from our master, altered, or from an old session
+  lastMasterSeenMs_ = nowMs;
+  if (!acceptSeqLocked(inner->seq)) return;  // duplicate or replayed within this session
+  if (const auto* cfg = std::get_if<proto::SlaveConfig>(&inner->body)) {
+    handleConfigLocked(*cfg);
+  } else if (const auto* pointer = std::get_if<proto::Pointer>(&inner->body)) {
+    handlePointerLocked(*pointer, nowMs);
+  } else if (const auto* key = std::get_if<proto::Key>(&inner->body)) {
+    handleKeyLocked(*key);
+  } else if (std::get_if<proto::Leave>(&inner->body)) {
+    if (active_ || keyHeldLocked()) deactivateLocked();
+  }
+}
+
+void SlaveEngine::handleConfigLocked(const proto::SlaveConfig& cfg) {
+  if (cfg.version != configVersion_ || !(cfg.offset == offset_)) {
+    configVersion_ = cfg.version;
+    offset_ = cfg.offset;
+    config_.setInt("config_version", configVersion_);
+    config_.setInt("offset_x", offset_.x);
+    config_.setInt("offset_y", offset_.y);
+    config_.set("master_name", masterName_);
+    if (!config_.save()) log::info("Failed to save " + config_.path().string());
+    log::info(log::fmt("Configuration from master applied: desktop origin at (%d, %d) in master layout", offset_.x,
+                       offset_.y));
+    ++changes_;
+  }
+  sendHelloLocked();  // acknowledges the configuration
+}
+
+bool SlaveEngine::acceptSeqLocked(uint32_t seq) {
+  // Sequence numbers only grow within a session; a new session (new key) starts a new count.
+  if (haveSeq_ && static_cast<int32_t>(seq - lastSeq_) <= 0) return false;
   haveSeq_ = true;
   lastSeq_ = seq;
   return true;
@@ -139,7 +203,6 @@ void SlaveEngine::handlePointerLocked(const proto::Pointer& p, uint64_t nowMs) {
     active_ = true;
     ++changes_;
   }
-
   const Point local = clampToMonitorsLocked({p.pos.x - offset_.x, p.pos.y - offset_.y});
   if (!havePos_ || !(local == lastPos_)) {
     injector_.moveTo(local);
@@ -155,7 +218,7 @@ void SlaveEngine::handlePointerLocked(const proto::Pointer& p, uint64_t nowMs) {
   buttons_ = p.buttons;
   if (p.wheelV) injector_.wheel(p.wheelV, false);
   if (p.wheelH) injector_.wheel(p.wheelH, true);
-  if (p.hasKeys) releaseKeysNotInLocked(p.keys);
+  releaseKeysNotInLocked(p.keys);
 }
 
 void SlaveEngine::deactivateLocked() {
@@ -192,9 +255,16 @@ void SlaveEngine::sendHelloLocked() {
   proto::SlaveHello hello;
   hello.name = options_.name;
   for (const MonitorInfo& m : monitors_) hello.monitors.push_back(m.rect);
-  hello.masterId = masterId_;
+  hello.masterId = hasTrusted_ ? masterId_ : 0;
   hello.configVersion = configVersion_;
   hello.address = transport_.primaryAddress();
+  hello.publicKey = options_.identity.publicKey;
+  hello.sessionNonce = sessionNonce_;
+  hello.sessionId = hasSession_ ? sessionId_ : 0;
+  if (hasTrusted_) {  // lets the master trust the fields above
+    const auto auth = proto::helloAuthData(options_.id, hello);
+    hello.mac = crypto::mac(pairKey_, auth.data(), auth.size());
+  }
   proto::Packet p;
   p.sender = options_.id;
   p.body = std::move(hello);
@@ -231,17 +301,42 @@ void SlaveEngine::tick(uint64_t nowMs) {
   }
 }
 
+void SlaveEngine::forgetMaster() {
+  std::lock_guard lock(mutex_);
+  if (active_ || keyHeldLocked()) deactivateLocked();
+  if (hasTrusted_) log::info("Forgot master '" + masterName_ + "'; any master can connect this PC now");
+  hasTrusted_ = false;
+  hasSession_ = false;
+  masterId_ = 0;
+  masterKey_ = {};
+  pairKey_ = {};
+  configVersion_ = 0;
+  masterSeen_ = false;
+  refusedLogged_ = false;
+  sessionNonce_ = crypto::randomArray<crypto::Nonce16>();
+  for (const char* key : {"master_id", "master_key", "master_name", "config_version", "offset_x", "offset_y"}) {
+    config_.erase(key);
+  }
+  if (!config_.save()) log::info("Failed to save " + config_.path().string());
+  ++changes_;
+  sendHelloLocked();
+}
+
 SlaveSnapshot SlaveEngine::snapshot() const {
   std::lock_guard lock(mutex_);
   SlaveSnapshot s;
-  s.configured = masterId_ != 0;
+  s.paired = hasTrusted_;
+  s.connected = hasSession_;
+  s.configured = hasTrusted_ && configVersion_ != 0;
   s.masterId = masterId_;
   s.masterName = masterName_;
+  s.masterFingerprint = hasTrusted_ ? crypto::fingerprint(masterKey_) : std::string();
   s.masterIp = masterIp_;
   s.masterOnline = masterSeen_;
   s.offset = offset_;
   s.active = active_;
   s.monitors = monitors_;
+  s.fingerprint = crypto::fingerprint(options_.identity.publicKey);
   return s;
 }
 

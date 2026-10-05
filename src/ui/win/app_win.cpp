@@ -28,6 +28,7 @@
 #include "app/network_loop.h"
 #include "app/slave_engine.h"
 #include "core/config.h"
+#include "core/crypto.h"
 #include "core/log.h"
 #include "core/protocol.h"
 #include "core/udp.h"
@@ -49,7 +50,7 @@ constexpr wchar_t kAppTitle[] = L"Net Mouse";
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT kTrayId = 1;
-enum : UINT { IDM_SHOW = 100, IDM_RETURN, IDM_CHANGE_ROLE, IDM_EXIT };
+enum : UINT { IDM_SHOW = 100, IDM_RETURN, IDM_CHANGE_ROLE, IDM_FORGET_MASTER, IDM_DISCONNECT, IDM_EXIT };
 
 constexpr char kDefaultGroup[] = "239.255.77.77";
 constexpr int kDefaultPort = 47800;
@@ -95,7 +96,8 @@ struct App {
   HICON iconActive = nullptr;
   bool trayActive = false;
   std::wstring trayTip;
-  bool showTrayHint = false;  // first run: tell the user where the app went
+  bool showTrayHint = false;
+  uint64_t menuSlave = 0;  // slave the canvas context menu is about  // first run: tell the user where the app went
 };
 
 App g;
@@ -208,38 +210,55 @@ void updateFonts() {
 
 std::wstring statusText() {
   std::wstring t;
-  t += std::format(L"{} • {} • id {} • group {}:{}\n", g.master ? L"MASTER" : L"SLAVE",
-                   widen(g.name), widen(toHex(g.id)), widen(g.group), g.port);
   if (g.master) {
     const MasterSnapshot s = g.master->snapshot();
+    t += std::format(L"MASTER • {} • fingerprint {} • group {}:{}\n", widen(g.name),
+                     widen(s.fingerprint), widen(g.group), g.port);
     if (s.remote) {
       std::string target = "?";
       for (const SlaveView& v : s.slaves) {
         if (v.id == s.activeSlave) target = v.name;
       }
-      t += std::format(L"Pointer is on slave \"{}\"  (Ctrl+Alt+Home brings it back)\n", widen(target));
+      t += std::format(L"Pointer and keyboard are on \"{}\"  (Ctrl+Alt+Home brings them back)\n", widen(target));
     } else {
       t += L"Pointer is on this PC\n";
     }
-    if (s.slaves.empty()) t += L"No slaves found yet.\n";
+    if (s.slaves.empty()) t += L"No other PCs found yet.\n";
     for (const SlaveView& v : s.slaves) {
-      t += std::format(L"  • {}  {}  {}{}  origin ({}, {})\n", widen(v.name), widen(ipToString(v.ip)),
-                       v.online ? L"online" : L"offline", v.online && !v.synced ? L", syncing" : L"",
-                       v.offset.x, v.offset.y);
+      std::wstring state;
+      if (!v.online) {
+        state = v.paired ? L"connected, offline" : L"offline";
+      } else if (v.keyMismatch) {
+        state = L"KEY CHANGED — not trusted";
+      } else if (!v.paired) {
+        state = v.otherMaster ? L"paired with another master" : L"available";
+      } else if (!v.connected) {
+        state = L"connecting…";
+      } else {
+        state = v.synced ? L"connected (encrypted)" : L"connected, syncing";
+      }
+      t += std::format(L"  • {}  {}  {}  •  fingerprint {}\n", widen(v.name), widen(ipToString(v.ip)), state,
+                       widen(v.fingerprint));
     }
-    t += L"Drag the green slave screens to where they physically are; the pointer crosses where screens touch.\n";
+    t += L"Click an available PC to connect it, drag connected screens to where they are; right-click one to "
+         L"disconnect.\n";
   } else {
     const SlaveSnapshot s = g.slave->snapshot();
-    if (!s.configured) {
-      t += s.masterOnline ? std::format(L"Master \"{}\" found at {}, waiting for its configuration…\n",
-                                        widen(s.masterName), widen(ipToString(s.masterIp)))
-                          : std::wstring(L"Looking for a master on the local network…\n");
+    t += std::format(L"SLAVE • {} • fingerprint {}\n", widen(g.name), widen(s.fingerprint));
+    if (!s.paired) {
+      t += s.masterOnline
+               ? std::format(L"Not connected. On the master \"{}\", click this PC (fingerprint {}) under Available.\n",
+                             widen(s.masterName), widen(s.fingerprint))
+               : std::wstring(L"Not connected. Looking for a master on the local network…\n");
     } else {
-      t += std::format(L"Master \"{}\" {} • this desktop's origin is at ({}, {}) in the master layout\n",
-                       widen(s.masterName.empty() ? toHex(s.masterId) : s.masterName),
-                       s.masterOnline ? L"online" : L"offline", s.offset.x, s.offset.y);
+      t += std::format(L"Paired with master \"{}\" (fingerprint {}) • {}\n", widen(s.masterName),
+                       widen(s.masterFingerprint),
+                       !s.masterOnline ? L"offline" : (s.connected ? L"connected (encrypted)" : L"connecting…"));
+      if (s.configured) {
+        t += std::format(L"This desktop's origin is at ({}, {}) in the master layout\n", s.offset.x, s.offset.y);
+      }
     }
-    t += s.active ? L"The master's pointer is on this PC\n" : L"Idle\n";
+    t += s.active ? L"The master's pointer and keyboard are on this PC\n" : L"Idle\n";
     for (size_t i = 0; i < s.monitors.size(); ++i) {
       const Rect& r = s.monitors[i].rect;
       t += std::format(L"  Monitor {}: {}×{} at ({}, {}){}\n", i + 1, r.width(), r.height(), r.left, r.top,
@@ -347,6 +366,7 @@ void showTrayMenu() {
   HMENU menu = CreatePopupMenu();
   AppendMenuW(menu, MF_STRING, IDM_SHOW, g.master ? L"Arrange displays…" : L"Status…");
   if (g.master) AppendMenuW(menu, MF_STRING, IDM_RETURN, L"Return pointer to this PC\tCtrl+Alt+Home");
+  if (g.slave && g.slave->snapshot().paired) AppendMenuW(menu, MF_STRING, IDM_FORGET_MASTER, L"Forget master…");
   AppendMenuW(menu, MF_STRING, IDM_CHANGE_ROLE, L"Change role…");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
@@ -401,6 +421,53 @@ void paint(HWND hwnd) {
   EndPaint(hwnd, &ps);
 }
 
+const SlaveView* findSlave(const MasterSnapshot& snap, uint64_t id) {
+  for (const SlaveView& v : snap.slaves) {
+    if (v.id == id) return &v;
+  }
+  return nullptr;
+}
+
+// Pairing: the user confirms the PC by its fingerprint, which the slave shows in its own window.
+void connectSlave(HWND hwnd, uint64_t id) {
+  const MasterSnapshot snap = g.master->snapshot();
+  const SlaveView* v = findSlave(snap, id);
+  if (!v) return;
+  if (v->otherMaster) {
+    const std::wstring text = std::format(
+        L"\"{}\" is paired with another master.\n\nOn that PC, choose \"Forget master\" in the Net Mouse tray menu "
+        L"(or run: net-mouse-ctl forget-master), then connect it here.",
+        widen(v->name));
+    MessageBoxW(hwnd, text.c_str(), kAppTitle, MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  const std::wstring warning =
+      v->keyMismatch ? L"\n\nWARNING: this PC now has a different key than the one connected before. Only continue "
+                       L"if it was reinstalled."
+                     : L"";
+  const std::wstring text = std::format(
+      L"Connect \"{}\" ({})?\n\nFingerprint: {}\n\nCheck that the Net Mouse window on that PC shows the same "
+      L"fingerprint. Once connected, this master controls it over an encrypted channel.{}",
+      widen(v->name), widen(ipToString(v->ip)), widen(v->fingerprint), warning);
+  if (MessageBoxW(hwnd, text.c_str(), kAppTitle, MB_OKCANCEL | (v->keyMismatch ? MB_ICONWARNING : MB_ICONQUESTION)) !=
+      IDOK) {
+    return;
+  }
+  if (v->keyMismatch) g.master->unpairSlave(id);
+  if (!g.master->pairSlave(id)) MessageBoxW(hwnd, L"That PC is no longer available.", kAppTitle, MB_OK | MB_ICONWARNING);
+  InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void disconnectSlave(HWND hwnd, uint64_t id) {
+  const MasterSnapshot snap = g.master->snapshot();
+  const SlaveView* v = findSlave(snap, id);
+  if (!v) return;
+  const std::wstring text =
+      std::format(L"Disconnect \"{}\"?\n\nThis master stops controlling it; it goes back to Available.", widen(v->name));
+  if (MessageBoxW(hwnd, text.c_str(), kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) g.master->unpairSlave(id);
+  InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   if (g.taskbarCreatedMsg && msg == g.taskbarCreatedMsg) {
     addTrayIcon();  // Explorer restarted
@@ -447,6 +514,12 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       return 0;
     }
     case WM_LBUTTONDOWN:
+      if (g.master) {
+        if (auto id = g.layoutView.availableAt({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) {
+          connectSlave(hwnd, *id);
+          return 0;
+        }
+      }
       if (g.master && g.layoutView.beginDrag({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) {
         SetCapture(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -467,6 +540,19 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (msg == WM_LBUTTONUP) ReleaseCapture();
         InvalidateRect(hwnd, nullptr, FALSE);
+      }
+      return 0;
+    case WM_RBUTTONUP:
+      if (g.master) {
+        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (auto id = g.layoutView.slaveAt(pt)) {
+          g.menuSlave = *id;
+          HMENU menu = CreatePopupMenu();
+          AppendMenuW(menu, MF_STRING, IDM_DISCONNECT, L"Disconnect this PC…");
+          ClientToScreen(hwnd, &pt);
+          TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+          DestroyMenu(menu);
+        }
       }
       return 0;
     case WM_TRAY:
@@ -490,6 +576,17 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
           break;
         case IDM_RETURN:
           if (g.master) g.master->onPanic();
+          break;
+        case IDM_DISCONNECT:
+          disconnectSlave(hwnd, g.menuSlave);
+          break;
+        case IDM_FORGET_MASTER:
+          if (g.slave && MessageBoxW(hwnd,
+                                     L"Forget the master this PC is paired with?\n\nIt will no longer control this PC "
+                                     L"until a master connects it again.",
+                                     kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+            g.slave->forgetMaster();
+          }
           break;
         case IDM_CHANGE_ROLE:
           if (MessageBoxW(hwnd, L"Net Mouse will restart and ask for the role of this PC.", kAppTitle,
@@ -640,13 +737,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     return fail(L"Network setup failed: " + widen(error));
   }
 
+  // This PC's key pair: the private half never leaves this PC (netmouse.key next to the settings).
+  crypto::Identity identity;
+  if (!crypto::loadOrCreateIdentity(fs::path(configPath).replace_extension(".key"), identity, error)) {
+    CloseHandle(instanceMutex);
+    return fail(L"Cannot load this PC's key: " + widen(error));
+  }
+  log::info("This PC's fingerprint: " + crypto::fingerprint(identity.publicKey));
+
   if (g.role == "master") {
     g.cursor.show();  // restore cursors in case a previous run crashed while they were hidden
-    MasterEngine::Options opt{g.id, g.name, g.config.getInt("hide_cursor", 1) != 0};
+    MasterEngine::Options opt{g.id, g.name, g.config.getInt("hide_cursor", 1) != 0, identity};
     g.master = std::make_unique<MasterEngine>(opt, g.config, g.net, g.displays, g.cursor);
   } else {
     g.injector = std::make_unique<WinInjector>(g.dryRun);
-    g.slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{g.id, g.name}, g.config, g.net, g.displays,
+    g.slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{g.id, g.name, identity}, g.config, g.net, g.displays,
                                             *g.injector);
   }
 

@@ -30,6 +30,13 @@ const Palette kMaster{gp::Color(255, 78, 140, 232), gp::Color(255, 38, 84, 168)}
 const Palette kSlave{gp::Color(255, 66, 196, 136), gp::Color(255, 26, 124, 84)};
 const Palette kSlaveDragging{gp::Color(255, 118, 220, 166), gp::Color(255, 50, 160, 110)};
 const Palette kSlaveOffline{gp::Color(255, 168, 174, 184), gp::Color(255, 118, 124, 134)};
+const Palette kAvailable{gp::Color(255, 132, 146, 168), gp::Color(255, 96, 108, 128)};
+const Palette kWarning{gp::Color(255, 226, 96, 88), gp::Color(255, 168, 48, 44)};
+
+// Slaves shown in the arrangement: connected ones (or being connected) with a trusted key.
+bool inLayout(const SlaveView& s) { return s.paired && !s.keyMismatch; }
+// Slaves shown as cards in the "Available" strip.
+bool isAvailable(const SlaveView& s) { return s.online && !inLayout(s); }
 const gp::Color kBezel(255, 34, 38, 46);
 const gp::Color kActive(255, 255, 140, 0);
 const gp::Color kCanvasTop(255, 246, 248, 251);
@@ -156,10 +163,17 @@ void drawMonitor(gp::Graphics& g, gp::RectF r, const Palette& palette, bool glow
 void LayoutView::paint(HDC dc, const RECT& area, const MasterSnapshot& snapshot, HFONT font, UINT dpi) {
   ensureGdiplus();
   snap_ = snapshot;
-  area_ = area;
   dpi_ = dpi;
-  if (!drag_) computeTransform();
   const float s = static_cast<float>(dpi) / 96.0f;
+  // Discovered PCs that are not connected get a strip of cards at the bottom.
+  std::vector<const SlaveView*> available;
+  for (const SlaveView& sv : snap_.slaves) {
+    if (isAvailable(sv)) available.push_back(&sv);
+  }
+  const int stripHeight = available.empty() ? 0 : MulDiv(104, static_cast<int>(dpi), 96);
+  area_ = area;
+  area_.bottom = std::max(area_.top + 1, area_.bottom - stripHeight);
+  if (!drag_) computeTransform();
 
   gp::Graphics g(dc);
   g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
@@ -200,17 +214,52 @@ void LayoutView::paint(HDC dc, const RECT& area, const MasterSnapshot& snapshot,
 
   for (const SlaveView& sv : snap_.slaves) {
     const bool isDragged = drag_ && drag_->id == sv.id;
-    if (!sv.online && !isDragged) continue;
+    if (!inLayout(sv) || (!sv.online && !isDragged)) continue;
     const Point off = offsetOf(sv);
     const bool active = snap_.remote && snap_.activeSlave == sv.id;
-    const Palette& palette = isDragged ? kSlaveDragging : (sv.online ? kSlave : kSlaveOffline);
+    const Palette& palette = isDragged ? kSlaveDragging : (sv.connected ? kSlave : kSlaveOffline);
     for (size_t i = 0; i < sv.monitors.size(); ++i) {
       const Rect r = sv.monitors[i].translated(off);
       std::vector<std::wstring> lines{widen(sv.name) + (sv.monitors.size() > 1 ? L"  #" + std::to_wstring(i + 1) : L"")};
       if (sv.ip) lines.push_back(widen(ipToString(sv.ip)));
       lines.push_back(resolution(r));
-      if (!sv.synced) lines.push_back(L"syncing…");
+      if (!sv.connected) {
+        lines.push_back(L"connecting…");
+      } else if (!sv.synced) {
+        lines.push_back(L"syncing…");
+      }
       drawMonitor(g, toRectF(r), palette, active, lines, fonts, s);
+    }
+  }
+
+  // "Available" strip: one card per discovered PC that is not connected.
+  availableCards_.clear();
+  if (!available.empty()) {
+    const float top = static_cast<float>(area_.bottom);
+    gp::SolidBrush sep(gp::Color(40, 40, 60, 90));
+    g.FillRectangle(&sep, bg.X + 12 * s, top, bg.Width - 24 * s, 1 * s);
+    gp::SolidBrush caption(gp::Color(255, 70, 80, 96));
+    g.DrawString(L"Available — click a PC to connect it", -1, &body,
+                 gp::PointF(bg.X + 16 * s, top + 6 * s), &caption);
+    const float cardW = 230 * s, cardH = 66 * s, gap = 12 * s;
+    float x = bg.X + 16 * s;
+    const float y = top + 28 * s;
+    for (const SlaveView* sv : available) {
+      if (x + cardW > bg.X + bg.Width) break;
+      std::vector<std::wstring> lines{widen(sv->name), widen(ipToString(sv->ip)) + L"  •  " + widen(sv->fingerprint)};
+      const Palette* palette = &kAvailable;
+      if (sv->keyMismatch) {
+        lines.push_back(L"key changed — click to trust it");
+        palette = &kWarning;
+      } else if (sv->otherMaster) {
+        lines.push_back(L"paired with another master");
+        palette = &kSlaveOffline;
+      }
+      drawMonitor(g, gp::RectF(x, y, cardW, cardH), *palette, false, lines, fonts, s);
+      availableCards_.push_back({RECT{static_cast<LONG>(x), static_cast<LONG>(y), static_cast<LONG>(x + cardW),
+                                      static_cast<LONG>(y + cardH)},
+                                 sv->id});
+      x += cardW + gap;
     }
   }
 
@@ -237,7 +286,7 @@ void LayoutView::computeTransform() {
   std::vector<Rect> all;
   for (const MonitorInfo& m : snap_.masterMonitors) all.push_back(m.rect);
   for (const SlaveView& s : snap_.slaves) {
-    if (!s.online) continue;
+    if (!s.online || !inLayout(s)) continue;
     for (const Rect& r : s.monitors) all.push_back(r.translated(s.offset));
   }
   const double aw = std::max<LONG>(1, area_.right - area_.left);
@@ -271,9 +320,27 @@ Point LayoutView::offsetOf(const SlaveView& s) const {
   return drag_ && drag_->id == s.id ? drag_->offset : s.offset;
 }
 
+std::optional<uint64_t> LayoutView::availableAt(POINT pt) const {
+  for (const auto& [rc, id] : availableCards_) {
+    if (PtInRect(&rc, pt)) return id;
+  }
+  return std::nullopt;
+}
+
+std::optional<uint64_t> LayoutView::slaveAt(POINT pt) const {
+  for (auto it = snap_.slaves.rbegin(); it != snap_.slaves.rend(); ++it) {
+    if (!it->online || !inLayout(*it)) continue;
+    for (const Rect& r : it->monitors) {
+      const RECT rc = toScreen(r.translated(it->offset));
+      if (PtInRect(&rc, pt)) return it->id;
+    }
+  }
+  return std::nullopt;
+}
+
 bool LayoutView::beginDrag(POINT pt) {
   for (auto it = snap_.slaves.rbegin(); it != snap_.slaves.rend(); ++it) {
-    if (!it->online) continue;
+    if (!it->online || !inLayout(*it)) continue;
     for (const Rect& r : it->monitors) {
       const RECT rc = toScreen(r.translated(it->offset));
       if (PtInRect(&rc, pt)) {
@@ -310,7 +377,7 @@ Point LayoutView::snap(const SlaveView& moving, Point offset) const {
   std::vector<Rect> others;
   for (const MonitorInfo& m : snap_.masterMonitors) others.push_back(m.rect);
   for (const SlaveView& s : snap_.slaves) {
-    if (s.id == moving.id || !s.online) continue;
+    if (s.id == moving.id || !s.online || !inLayout(s)) continue;
     for (const Rect& r : s.monitors) others.push_back(r.translated(s.offset));
   }
   const double threshold = MulDiv(12, static_cast<int>(dpi_), 96) / scale_;

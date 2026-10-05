@@ -24,6 +24,7 @@
 #include "app/network_loop.h"
 #include "app/slave_engine.h"
 #include "core/config.h"
+#include "core/crypto.h"
 #include "core/log.h"
 #include "core/udp.h"
 #include "linux/control.h"
@@ -154,27 +155,32 @@ std::string statusJson(const DaemonState& st) {
                              jsonEscape(st.configPath).c_str(), jsonEscape(st.monitorSpec).c_str());
   if (st.master) {
     const MasterSnapshot s = st.master->snapshot();
-    out += log::fmt("\"remote\":%s,\"active\":\"%s\",\"pointer\":%s,\"monitors\":%s,\"slaves\":[",
-                    s.remote ? "true" : "false", s.remote ? toHex(s.activeSlave).c_str() : "",
+    out += log::fmt("\"fingerprint\":\"%s\",\"remote\":%s,\"active\":\"%s\",\"pointer\":%s,\"monitors\":%s,\"slaves\":[",
+                    s.fingerprint.c_str(), s.remote ? "true" : "false", s.remote ? toHex(s.activeSlave).c_str() : "",
                     pointJson(s.virtualPos).c_str(), monitorsJson(s.masterMonitors).c_str());
+    auto b = [](bool v) { return v ? "true" : "false"; };
     for (size_t i = 0; i < s.slaves.size(); ++i) {
       const SlaveView& v = s.slaves[i];
       if (i) out += ",";
-      out += log::fmt("{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"online\":%s,\"synced\":%s,\"offset\":%s,\"monitors\":[",
-                      toHex(v.id).c_str(), jsonEscape(v.name).c_str(), ipToString(v.ip).c_str(),
-                      v.online ? "true" : "false", v.synced ? "true" : "false", pointJson(v.offset).c_str());
+      out += log::fmt(
+          "{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"online\":%s,\"paired\":%s,\"connected\":%s,"
+          "\"synced\":%s,\"key_mismatch\":%s,\"other_master\":%s,\"fingerprint\":\"%s\",\"offset\":%s,\"monitors\":[",
+          toHex(v.id).c_str(), jsonEscape(v.name).c_str(), ipToString(v.ip).c_str(), b(v.online), b(v.paired),
+          b(v.connected), b(v.synced), b(v.keyMismatch), b(v.otherMaster), v.fingerprint.c_str(),
+          pointJson(v.offset).c_str());
       for (size_t k = 0; k < v.monitors.size(); ++k) out += (k ? "," : "") + rectJson(v.monitors[k]);
       out += "]}";
     }
     out += "]}";
   } else {
     const SlaveSnapshot s = st.slave->snapshot();
+    auto b = [](bool v) { return v ? "true" : "false"; };
     out += log::fmt(
-        "\"configured\":%s,\"active\":%s,\"offset\":%s,\"monitors\":%s,"
-        "\"master\":{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"online\":%s}}",
-        s.configured ? "true" : "false", s.active ? "true" : "false", pointJson(s.offset).c_str(),
+        "\"fingerprint\":\"%s\",\"paired\":%s,\"connected\":%s,\"configured\":%s,\"active\":%s,\"offset\":%s,"
+        "\"monitors\":%s,\"master\":{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"online\":%s,\"fingerprint\":\"%s\"}}",
+        s.fingerprint.c_str(), b(s.paired), b(s.connected), b(s.configured), b(s.active), pointJson(s.offset).c_str(),
         monitorsJson(s.monitors).c_str(), toHex(s.masterId).c_str(), jsonEscape(s.masterName).c_str(),
-        s.masterIp ? ipToString(s.masterIp).c_str() : "", s.masterOnline ? "true" : "false");
+        s.masterIp ? ipToString(s.masterIp).c_str() : "", b(s.masterOnline), s.masterFingerprint.c_str());
   }
   return out;
 }
@@ -206,8 +212,29 @@ std::string handleRequest(const DaemonState& st, const std::string& request, boo
   std::string cmd;
   in >> cmd;
   if (cmd == "status") return statusJson(st);
-  if (cmd == "set-offset" || cmd == "set-role" || cmd == "set-monitors") {
-    if (!privileged) return "error permission denied: needs root or membership in sudo/wheel/admin/netmouse";
+  if (cmd != "status" && !privileged) {
+    return "error permission denied: needs root or membership in sudo/wheel/admin/netmouse";
+  }
+  if (cmd == "pair" || cmd == "unpair") {
+    std::string id;
+    if (!st.master) return "error only a master connects PCs";
+    if (!(in >> id)) return "error usage: " + cmd + " SLAVE_ID";
+    uint64_t slaveId = 0;
+    try {
+      slaveId = std::stoull(id, nullptr, 16);
+    } catch (...) {
+      return "error bad slave id";
+    }
+    if (cmd == "pair") {
+      return st.master->pairSlave(slaveId) ? "ok"
+                                           : "error that PC is not available (offline, or paired with another master)";
+    }
+    return st.master->unpairSlave(slaveId) ? "ok" : "error that PC is not connected";
+  }
+  if (cmd == "forget-master") {
+    if (!st.slave) return "error only a slave has a master to forget";
+    st.slave->forgetMaster();
+    return "ok";
   }
   if (cmd == "set-offset") {
     std::string id;
@@ -237,7 +264,8 @@ std::string handleRequest(const DaemonState& st, const std::string& request, boo
     log::info("Monitor layout changed to '" + (spec.empty() ? std::string("auto") : spec) + "' via the control socket");
     return saveSetting(st.configPath, "monitors", spec);
   }
-  return "error unknown request '" + cmd + "' (status, set-offset, set-role, set-monitors)";
+  return "error unknown request '" + cmd +
+         "' (status, pair, unpair, set-offset, forget-master, set-role, set-monitors)";
 }
 
 }  // namespace
@@ -307,6 +335,15 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // This PC's key pair, next to the settings (netmouse.ini -> netmouse.key, readable by root only).
+  crypto::Identity identity;
+  const std::filesystem::path keyPath = std::filesystem::path(args.config).replace_extension(".key");
+  if (!crypto::loadOrCreateIdentity(keyPath, identity, error)) {
+    log::info("Cannot load this PC's key: " + error);
+    return 1;
+  }
+  log::info("This PC's fingerprint: " + crypto::fingerprint(identity.publicKey));
+
   // The virtual pointer covers the bounding box of all monitors; the display server maps the
   // device's absolute range onto its whole desktop.
   std::vector<Rect> rects;
@@ -325,7 +362,7 @@ int main(int argc, char** argv) {
   std::unique_ptr<EvdevCapture> capture;
   if (role == "master") {
     cursor = std::make_unique<LinuxCursor>(device);
-    master = std::make_unique<MasterEngine>(MasterEngine::Options{id, name, true}, config, net, displays, *cursor);
+    master = std::make_unique<MasterEngine>(MasterEngine::Options{id, name, true, identity}, config, net, displays, *cursor);
     // We own the cursor position from now on: start in the middle of the primary monitor.
     cursor->setPos(displays.monitors().front().rect.center());
     EvdevCapture::Options opt;
@@ -338,7 +375,7 @@ int main(int argc, char** argv) {
     }
   } else {
     injector = std::make_unique<LinuxInjector>(device, args.dryRun);
-    slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{id, name}, config, net, displays, *injector);
+    slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{id, name, identity}, config, net, displays, *injector);
   }
 
   DaemonState state{role, name, id, args.config, monitorSpec, master.get(), slave.get()};

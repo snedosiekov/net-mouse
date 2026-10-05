@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(net-mouse VERSION 0.1.0 LANGUAGES CXX)
+project(net-mouse VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,9 +8,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
   # Static runtime: a single .exe can be copied to every PC without installing redistributables.
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-  add_compile_options(/W4 /utf-8 /permissive-)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/W4;/utf-8;/permissive->")
 else()
-  add_compile_options(-Wall -Wextra)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra>")
 endif()
 
 if(WIN32)
@@ -21,6 +21,8 @@ endif()
 add_library(nm_core STATIC
   src/core/protocol.cpp
   src/core/keymap.cpp
+  src/core/crypto.cpp
+  third_party/monocypher/monocypher.c
   src/core/layout.cpp
   src/core/config.cpp
   src/core/log.cpp
@@ -29,11 +31,13 @@ add_library(nm_core STATIC
   src/app/slave_engine.cpp
   src/app/network_loop.cpp
 )
-target_include_directories(nm_core PUBLIC src)
+target_include_directories(nm_core PUBLIC src PRIVATE third_party/monocypher)
+# Third-party code: compiled as is, without our warning flags.
+set_source_files_properties(third_party/monocypher/monocypher.c PROPERTIES COMPILE_OPTIONS "$<IF:$<C_COMPILER_ID:MSVC>,/W0,-w>")
 find_package(Threads REQUIRED)
 target_link_libraries(nm_core PUBLIC Threads::Threads)
 if(WIN32)
-  target_link_libraries(nm_core PUBLIC ws2_32 iphlpapi)
+  target_link_libraries(nm_core PUBLIC ws2_32 iphlpapi bcrypt)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

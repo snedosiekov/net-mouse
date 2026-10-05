@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 import re
+import socket
 import struct
 import subprocess
 import sys
@@ -135,7 +136,25 @@ def main():
              for r in ("slave", "master")}
     try:
         log = lambda r: open(f"{tmp}/{r}.log").read()
+        query = lambda r, req: subprocess.run([daemon, "--control", f"{tmp}/{r}.sock", "--query", req],
+                                              capture_output=True, text=True).stdout.strip()
+
+        def master_slaves():
+            try:
+                return json.loads(query("master", "status")).get("slaves", [])
+            except ValueError:
+                return []
+
+        # Discovered, but nothing flows until the master connects (pairs) it.
+        check(wait_for(lambda: any(s["online"] for s in master_slaves())), "slave discovered by the master")
+        found = master_slaves()[0]
+        check(not found["paired"] and not found["connected"], "a discovered PC is only 'available'")
+        slave_fp = json.loads(query("slave", "status"))["fingerprint"]
+        check(found["fingerprint"] == slave_fp, "master shows the slave's real fingerprint")
+        check(query("master", f"pair {found['id']}") == "ok", "pair command accepted")
         check(wait_for(lambda: "Configuration from master applied" in log("slave")), "slave configured by master")
+        check(wait_for(lambda: master_slaves()[0]["connected"]), "encrypted session established")
+        check("Paired with master" in log("slave"), "slave pinned the master's key")
         check(wait_for(lambda: "Using mouse 'Test Physical Mouse'" in log("master")), "master grabbed the fake mouse")
         check(wait_for(lambda: "Using keyboard 'Test Physical Keyboard'" in log("master")),
               "master grabbed the fake keyboard")
@@ -222,8 +241,6 @@ def main():
               f"slave released Ctrl/Alt and never saw Home ({received})")
 
         # Control socket (used by net-mouse-gui / net-mouse-ctl).
-        query = lambda r, req: subprocess.run([daemon, "--control", f"{tmp}/{r}.sock", "--query", req],
-                                              capture_output=True, text=True).stdout.strip()
         status = json.loads(query("master", "status"))
         slaves = status.get("slaves", [])
         check(status.get("role") == "master" and len(slaves) == 1 and slaves[0]["online"],
@@ -240,6 +257,19 @@ def main():
                                        f"set-offset {slaves[0]['id']} 1920 0"], capture_output=True, text=True)
         check("permission denied" in unprivileged.stdout,
               f"control socket: changes refused for unprivileged users ({(unprivileged.stdout + unprivileged.stderr).strip()})")
+
+        # A forged, unencrypted pointer packet claiming to come from the master is ignored.
+        slave_id = int(json.loads(query("slave", "status"))["id"], 16)
+        master_id = int(status["id"], 16)
+        slave_ptr.drain()
+        forged = (struct.pack("<IBBQI", 0x45534D4E, 2, 4, master_id, 0xFFFFFF00) +
+                  struct.pack("<QiiBhh", slave_id, 300, 300, 1, 0, 0) + bytes(32))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        for _ in range(3):
+            sock.sendto(forged, ("239.255.77.77", int(PORT)))
+        time.sleep(0.3)
+        check(not slave_ptr.drain(), "a forged unencrypted pointer packet is ignored")
     finally:
         for p in procs.values():
             p.terminate()

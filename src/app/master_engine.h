@@ -1,10 +1,14 @@
 #pragma once
 
-// Master role: decides whether the pointer is on the master or on a slave, swallows local mouse
-// input while it is on a slave, and streams the pointer state to that slave.
+// Master role: decides whether the pointer is on the master or on a slave, swallows local mouse and
+// keyboard input while it is on a slave, and streams it, encrypted, to that slave.
 //
-// Threads: onMouse* run on the capture (hook) thread, onPacket/tick on the network thread,
-// snapshot/setSlaveOffset on the UI thread. One mutex guards all state.
+// Pairing: discovered slaves are "available" until the user connects them (pairSlave). Pairing pins
+// the slave's public key; from then on a session key is agreed with every (re)start of either side
+// and all traffic to the slave is sealed with it.
+//
+// Threads: onMouse*/onKey run on the capture (hook) thread, onPacket/tick on the network thread,
+// snapshot/setSlaveOffset/pair on the UI thread. One mutex guards all state.
 
 #include <atomic>
 #include <map>
@@ -14,6 +18,7 @@
 #include <vector>
 
 #include "core/config.h"
+#include "core/crypto.h"
 #include "core/layout.h"
 #include "core/protocol.h"
 #include "core/transport.h"
@@ -27,8 +32,13 @@ struct SlaveView {
   uint32_t ip = 0;
   std::vector<Rect> monitors;  // slave-local coordinates
   Point offset;                // slave-local origin in master layout space
-  bool online = false;
+  bool online = false;         // heard from recently
+  bool paired = false;         // the user connected it (its public key is pinned)
+  bool connected = false;      // paired and an encrypted session is established
   bool synced = false;         // the slave confirmed the current configuration
+  bool keyMismatch = false;    // announces a different public key than the pinned one
+  bool otherMaster = false;    // paired with another master
+  std::string fingerprint;     // of the public key it announces
 };
 
 struct MasterSnapshot {
@@ -37,6 +47,7 @@ struct MasterSnapshot {
   bool remote = false;
   uint64_t activeSlave = 0;
   Point virtualPos;
+  std::string fingerprint;  // this master's
 };
 
 class MasterEngine : public IInputSink {
@@ -45,6 +56,7 @@ class MasterEngine : public IInputSink {
     uint64_t id = 0;
     std::string name;
     bool hideCursor = true;
+    crypto::Identity identity;
   };
 
   MasterEngine(Options options, Config& config, ITransport& transport, IDisplays& displays,
@@ -65,6 +77,8 @@ class MasterEngine : public IInputSink {
   // UI thread
   MasterSnapshot snapshot() const;
   bool setSlaveOffset(uint64_t slaveId, Point offset);  // false if it would overlap another screen
+  bool pairSlave(uint64_t slaveId);                     // "connect": trust the key it announces now
+  bool unpairSlave(uint64_t slaveId);                   // "disconnect": forget its key
   uint64_t changeCounter() const { return changes_.load(); }
 
  private:
@@ -73,6 +87,15 @@ class MasterEngine : public IInputSink {
     uint32_t version = 0;
     uint64_t lastConfigSentMs = 0;
     bool configDue = true;
+    bool placed = false;
+    crypto::Key announcedKey{};    // from its latest hello
+    crypto::Key pinnedKey{};       // trusted key (valid when paired)
+    crypto::Key pairKey{};         // static master/slave key
+    crypto::Nonce16 slaveNonce{};  // from its latest hello: input for the next session
+    bool hasSession = false;
+    crypto::Key sessionKey{};
+    uint64_t sessionId = 0;
+    uint64_t lastSessionInitMs = 0;
   };
 
   void refreshMonitorsLocked();
@@ -80,19 +103,20 @@ class MasterEngine : public IInputSink {
   Slave* findSlaveLocked(uint64_t id);
   uint32_t allocVersionLocked();
   void saveSlaveLocked(const Slave& s);
-  void placeNewSlaveLocked(Slave& s);
+  void ensurePlacedLocked(Slave& s);
   void sendConfigLocked(Slave& s, uint64_t nowMs);
+  void startSessionLocked(Slave& s, uint64_t nowMs);
   void handleHelloLocked(const proto::SlaveHello& hello, uint64_t sender, uint32_t ip, uint64_t nowMs);
+  void setConnectedLocked(Slave& s, bool connected);
 
   void enterRemoteLocked(uint64_t slaveId, Point at, Point returnPoint);
   void leaveRemoteLocked(Point at);
+  bool sendSealedLocked(uint64_t slaveId, proto::Body body, int repeats);
   void sendPointerLocked(int16_t wheelV, int16_t wheelH, int repeats);
   void sendLeaveLocked();
   void sendKeyLocked(uint64_t slaveId, uint16_t code, int value);
   proto::KeySet keysOfLocked(uint64_t owner) const;
   bool heldLocked(uint16_t code) const { return keyOwner_.count(code) != 0; }
-  uint32_t slaveIpLocked(uint64_t slaveId);
-  uint32_t targetIpLocked();
   Point parkPointLocked() const;
 
   const Options options_;
@@ -124,6 +148,7 @@ class MasterEngine : public IInputSink {
   uint64_t lastMonitorRefreshMs_ = 0;
   uint64_t lastHeartbeatMs_ = 0;
   bool announced_ = false;
+  uint64_t nowMs_ = 0;  // latest time seen by the network thread (for UI-initiated actions)
 
   std::atomic<uint64_t> changes_{0};
 };
