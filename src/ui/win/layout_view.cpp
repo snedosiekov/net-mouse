@@ -170,7 +170,7 @@ void LayoutView::paint(HDC dc, const RECT& area, const MasterSnapshot& snapshot,
   for (const SlaveView& sv : snap_.slaves) {
     if (isAvailable(sv)) available.push_back(&sv);
   }
-  const int stripHeight = available.empty() ? 0 : MulDiv(104, static_cast<int>(dpi), 96);
+  const int stripHeight = available.empty() ? 0 : MulDiv(108, static_cast<int>(dpi), 96);
   area_ = area;
   area_.bottom = std::max(area_.top + 1, area_.bottom - stripHeight);
   if (!drag_) computeTransform();
@@ -241,12 +241,12 @@ void LayoutView::paint(HDC dc, const RECT& area, const MasterSnapshot& snapshot,
     gp::SolidBrush caption(gp::Color(255, 70, 80, 96));
     g.DrawString(L"Available — click a PC to connect it", -1, &body,
                  gp::PointF(bg.X + 16 * s, top + 6 * s), &caption);
-    const float cardW = 230 * s, cardH = 66 * s, gap = 12 * s;
+    const float cardW = 230 * s, cardH = 70 * s, gap = 12 * s;
     float x = bg.X + 16 * s;
     const float y = top + 28 * s;
     for (const SlaveView* sv : available) {
       if (x + cardW > bg.X + bg.Width) break;
-      std::vector<std::wstring> lines{widen(sv->name), widen(ipToString(sv->ip)) + L"  •  " + widen(sv->fingerprint)};
+      std::vector<std::wstring> lines{widen(sv->name), widen(ipToString(sv->ip)), widen(sv->fingerprint)};
       const Palette* palette = &kAvailable;
       if (sv->keyMismatch) {
         lines.push_back(L"key changed — click to trust it");

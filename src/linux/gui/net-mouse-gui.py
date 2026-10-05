@@ -385,7 +385,7 @@ class App:
             for v in available:
                 if x + 230 > w_c:
                     break
-                lines = [v["name"], f"{v['ip']}  \u2022  {v['fingerprint']}"]
+                lines = [v["name"], v["ip"], v["fingerprint"]]
                 colors = AVAILABLE_COLORS
                 if v["key_mismatch"]:
                     lines.append("key changed \u2014 click to trust it")
