@@ -87,19 +87,53 @@ void SlaveEngine::onPacket(const proto::Packet& packet, uint32_t sourceIp, uint6
       if (active_) deactivateLocked();  // the master moved on to another slave
       return;
     }
-    handlePointerLocked(*pointer, packet.seq, nowMs);
+    if (acceptSeqLocked(packet.seq)) handlePointerLocked(*pointer, nowMs);
+  } else if (const auto* key = std::get_if<proto::Key>(&packet.body)) {
+    if (packet.sender != masterId_ || masterId_ == 0 || key->target != options_.id) return;
+    lastMasterSeenMs_ = nowMs;
+    if (acceptSeqLocked(packet.seq)) handleKeyLocked(*key);
   } else if (const auto* leave = std::get_if<proto::Leave>(&packet.body)) {
-    if (packet.sender == masterId_ && leave->target == options_.id && active_) deactivateLocked();
+    if (packet.sender == masterId_ && leave->target == options_.id && (active_ || keyHeldLocked())) {
+      deactivateLocked();
+    }
   }
 }
 
-void SlaveEngine::handlePointerLocked(const proto::Pointer& p, uint32_t seq, uint64_t nowMs) {
+bool SlaveEngine::acceptSeqLocked(uint32_t seq) {
   if (haveSeq_) {
     const int32_t diff = static_cast<int32_t>(seq - lastSeq_);
-    if (diff <= 0 && diff > -kSeqRestartWindow) return;  // duplicate or reordered packet
+    if (diff <= 0 && diff > -kSeqRestartWindow) return false;  // duplicate or reordered packet
   }
   haveSeq_ = true;
   lastSeq_ = seq;
+  return true;
+}
+
+void SlaveEngine::handleKeyLocked(const proto::Key& k) {
+  lastPointerMs_ = nowMs_;  // any input from the master keeps the stream alive
+  if (k.value == 0) {
+    if (keys_.has(k.code) || k.code >= 256) injector_.key(k.code, 0);
+    keys_.set(k.code, false);
+  } else {
+    // An auto-repeat for a key we never saw pressed (lost press) becomes a press.
+    injector_.key(k.code, k.value == 2 && keys_.has(k.code) ? 2 : 1);
+    keys_.set(k.code, true);
+  }
+  releaseKeysNotInLocked(k.held);
+}
+
+void SlaveEngine::releaseKeysNotInLocked(const proto::KeySet& held) {
+  for (uint16_t code = 0; code < 256; ++code) {
+    if (keys_.has(code) && !held.has(code)) {  // its release packet was lost
+      injector_.key(code, 0);
+      keys_.set(code, false);
+    }
+  }
+}
+
+bool SlaveEngine::keyHeldLocked() const { return !(keys_ == proto::KeySet{}); }
+
+void SlaveEngine::handlePointerLocked(const proto::Pointer& p, uint64_t nowMs) {
   lastPointerMs_ = nowMs;
   if (!active_) {
     active_ = true;
@@ -121,6 +155,7 @@ void SlaveEngine::handlePointerLocked(const proto::Pointer& p, uint32_t seq, uin
   buttons_ = p.buttons;
   if (p.wheelV) injector_.wheel(p.wheelV, false);
   if (p.wheelH) injector_.wheel(p.wheelH, true);
+  if (p.hasKeys) releaseKeysNotInLocked(p.keys);
 }
 
 void SlaveEngine::deactivateLocked() {
@@ -128,6 +163,7 @@ void SlaveEngine::deactivateLocked() {
     if (buttons_ & b) injector_.button(b, false);
   }
   buttons_ = 0;
+  releaseKeysNotInLocked(proto::KeySet{});  // never leave a key held down
   active_ = false;
   havePos_ = false;
   ++changes_;
@@ -184,8 +220,8 @@ void SlaveEngine::tick(uint64_t nowMs) {
     lastHelloMs_ = nowMs;
     sendHelloLocked();
   }
-  if (active_ && nowMs - lastPointerMs_ > kPointerTimeoutMs) {
-    log::info("Lost the master's pointer stream; releasing buttons");
+  if ((active_ || keyHeldLocked()) && nowMs - lastPointerMs_ > kPointerTimeoutMs) {
+    log::info("Lost the master's input stream; releasing buttons and keys");
     deactivateLocked();
   }
   if (masterSeen_ && nowMs - lastMasterSeenMs_ > kMasterTimeoutMs) {

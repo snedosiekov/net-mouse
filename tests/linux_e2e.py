@@ -55,6 +55,24 @@ class FakeMouse:
         os.close(self.fd)
 
 
+KEY_LEFTCTRL, KEY_A, KEY_LEFTALT, KEY_HOME = 29, 30, 56, 102
+
+
+class FakeKeyboard(FakeMouse):
+    def __init__(self, name="Test Physical Keyboard"):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        for code in range(1, 128):  # a full main block including A, Z, Ctrl, Alt, Home
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+        setup = struct.pack("HHHH80sI", 0x03, 0x1234, 0x5679, 1, name.encode(), 0)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def tap(self, code):
+        self.emit((EV_KEY, code, 1))
+        self.emit((EV_KEY, code, 0))
+
+
 def input_devices():
     """{name: (event node, handlers)} from /proc/bus/input/devices."""
     result = {}
@@ -109,6 +127,7 @@ def main():
             failures.append(what)
 
     mouse = FakeMouse()
+    keyboard = FakeKeyboard()
     time.sleep(0.3)
     logs = {r: open(f"{tmp}/{r}.log", "w+") for r in ("master", "slave")}
     procs = {r: subprocess.Popen([daemon, "--config", f"{tmp}/{r}.ini", "--control", f"{tmp}/{r}.sock"],
@@ -118,12 +137,22 @@ def main():
         log = lambda r: open(f"{tmp}/{r}.log").read()
         check(wait_for(lambda: "Configuration from master applied" in log("slave")), "slave configured by master")
         check(wait_for(lambda: "Using mouse 'Test Physical Mouse'" in log("master")), "master grabbed the fake mouse")
+        check(wait_for(lambda: "Using keyboard 'Test Physical Keyboard'" in log("master")),
+              "master grabbed the fake keyboard")
         devices = input_devices()
         check(all("js" not in h for n, (_, h) in devices.items() if n.startswith("net-mouse")),
               "virtual devices are not exposed as joysticks")
         master_ptr = Reader(devices["net-mouse master pointer"][0])
         slave_ptr = Reader(devices["net-mouse slave pointer"][0])
+        master_keys = Reader(devices["net-mouse master pointer (buttons)"][0])
+        slave_keys = Reader(devices["net-mouse slave pointer (buttons)"][0])
+        keys_of = lambda ev: [(c, v) for t, c, v in ev if t == EV_KEY]
         time.sleep(0.5)  # let the slave's next hello confirm the configuration
+
+        keyboard.tap(KEY_A)
+        time.sleep(0.2)
+        check(keys_of(master_keys.drain()) == [(KEY_A, 1), (KEY_A, 0)] and not keys_of(slave_keys.drain()),
+              "keyboard: keys stay on the master while the pointer is there")
 
         for _ in range(9):  # 960 -> 1860: stays on the master
             mouse.move(100)
@@ -162,6 +191,11 @@ def main():
         check((EV_REL, REL_WHEEL, -1) in ev, "wheel delivered to the slave")
         check(not any(t == EV_KEY for t, _, _ in master_ptr.drain()), "click not delivered to the master")
 
+        keyboard.tap(KEY_A)
+        time.sleep(0.3)
+        check(keys_of(slave_keys.drain()) == [(KEY_A, 1), (KEY_A, 0)], "keyboard: keys go to the slave with the pointer")
+        check(not keys_of(master_keys.drain()), "keyboard: the master does not see them")
+
         for _ in range(7):  # back across the edge: 2420 -> 1720
             mouse.move(-100)
             time.sleep(0.02)
@@ -169,6 +203,23 @@ def main():
         ev = master_ptr.drain()
         xs = [v for t, c, v in ev if t == EV_ABS and c == ABS_X]
         check(bool(xs) and xs[-1] == 1720, f"pointer returned to the master (last x={xs[-1] if xs else None})")
+
+        # Emergency hotkey while the keyboard goes to the slave.
+        for _ in range(3):  # 1720 -> back across the edge onto the slave
+            mouse.move(100)
+            time.sleep(0.02)
+        time.sleep(0.2)
+        slave_keys.drain()
+        for code in (KEY_LEFTCTRL, KEY_LEFTALT, KEY_HOME):
+            keyboard.emit((EV_KEY, code, 1))
+        time.sleep(0.3)
+        for code in (KEY_HOME, KEY_LEFTALT, KEY_LEFTCTRL):
+            keyboard.emit((EV_KEY, code, 0))
+        time.sleep(0.3)
+        check("Emergency hotkey" in log("master"), "Ctrl+Alt+Home returns the pointer to the master")
+        received = keys_of(slave_keys.drain())
+        check((KEY_HOME, 1) not in received and (KEY_LEFTCTRL, 0) in received and (KEY_LEFTALT, 0) in received,
+              f"slave released Ctrl/Alt and never saw Home ({received})")
 
         # Control socket (used by net-mouse-gui / net-mouse-ctl).
         query = lambda r, req: subprocess.run([daemon, "--control", f"{tmp}/{r}.sock", "--query", req],
@@ -195,6 +246,7 @@ def main():
         for p in procs.values():
             p.wait(timeout=5)
         mouse.close()
+        keyboard.close()
         for r in ("master", "slave"):
             print(f"--- {r} log")
             print(open(f"{tmp}/{r}.log").read().rstrip())

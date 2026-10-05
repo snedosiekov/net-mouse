@@ -5,6 +5,7 @@
 #include <format>
 #include <future>
 
+#include "core/keymap.h"
 #include "core/log.h"
 #include "core/protocol.h"
 
@@ -12,7 +13,7 @@ namespace nm {
 namespace {
 
 constexpr int kPanicHotkeyId = 1;
-WinMouseHook* g_hook = nullptr;  // the hook procedure has no user pointer
+WinInputHook* g_hook = nullptr;  // the hook procedure has no user pointer
 
 std::string narrow(const wchar_t* w) {
   const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
@@ -150,9 +151,30 @@ void WinInjector::wheel(int delta, bool horizontal) {
   sendMouse(horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL, 0, 0, static_cast<DWORD>(delta));
 }
 
+void WinInjector::key(uint16_t code, int value) {
+  if (dryRun_) {
+    log::info(log::fmt("[dry-run] key %u %s", code, value == 0 ? "up" : (value == 2 ? "repeat" : "down")));
+    return;
+  }
+  keymap::WinKey wk;
+  if (!keymap::toWindows(code, wk)) return;  // no Windows equivalent
+  INPUT in{};
+  in.type = INPUT_KEYBOARD;
+  if (wk.vk) {
+    in.ki.wVk = wk.vk;
+  } else {
+    // Scan codes describe the physical key, so this PC's own keyboard layout applies.
+    in.ki.wScan = wk.scan;
+    in.ki.dwFlags = KEYEVENTF_SCANCODE;
+  }
+  if (wk.extended) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+  if (value == 0) in.ki.dwFlags |= KEYEVENTF_KEYUP;
+  SendInput(1, &in, sizeof(in));
+}
+
 // ---------------------------------------------------------------------------------------------
 
-bool WinMouseHook::start(IMouseSink* sink) {
+bool WinInputHook::start(IInputSink* sink) {
   sink_ = sink;
   g_hook = this;
   std::promise<bool> ready;
@@ -166,14 +188,18 @@ bool WinMouseHook::start(IMouseSink* sink) {
   return true;
 }
 
-void WinMouseHook::run(void* readyPtr) {
+void WinInputHook::run(void* readyPtr) {
   auto* ready = static_cast<std::promise<bool>*>(readyPtr);
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
   threadId_ = GetCurrentThreadId();
   MSG msg;
   PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // creates the message queue
-  hook_ = SetWindowsHookExW(WH_MOUSE_LL, &WinMouseHook::hookProc, GetModuleHandleW(nullptr), 0);
-  if (!hook_) {
+  mouseHook_ = SetWindowsHookExW(WH_MOUSE_LL, &WinInputHook::mouseProc, GetModuleHandleW(nullptr), 0);
+  keyboardHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, &WinInputHook::keyboardProc, GetModuleHandleW(nullptr), 0);
+  if (!mouseHook_ || !keyboardHook_) {
+    if (mouseHook_) UnhookWindowsHookEx(mouseHook_);
+    if (keyboardHook_) UnhookWindowsHookEx(keyboardHook_);
+    mouseHook_ = keyboardHook_ = nullptr;
     ready->set_value(false);
     return;
   }
@@ -186,21 +212,45 @@ void WinMouseHook::run(void* readyPtr) {
     if (msg.message == WM_HOTKEY && msg.wParam == kPanicHotkeyId) sink_->onPanic();
   }
   UnregisterHotKey(nullptr, kPanicHotkeyId);
-  UnhookWindowsHookEx(hook_);
-  hook_ = nullptr;
+  UnhookWindowsHookEx(mouseHook_);
+  UnhookWindowsHookEx(keyboardHook_);
+  mouseHook_ = keyboardHook_ = nullptr;
 }
 
-void WinMouseHook::stop() {
+void WinInputHook::stop() {
   if (!thread_.joinable()) return;
   PostThreadMessageW(threadId_, WM_QUIT, 0, 0);
   thread_.join();
   g_hook = nullptr;
 }
 
-LRESULT CALLBACK WinMouseHook::hookProc(int code, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK WinInputHook::keyboardProc(int code, WPARAM wParam, LPARAM lParam) {
+  if (code == HC_ACTION && g_hook) {
+    const auto* k = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+    // Injected keys (other software, remote desktop tools) are left alone.
+    if (!(k->flags & LLKHF_INJECTED)) {
+      IInputSink* sink = g_hook->sink_;
+      const bool up = (k->flags & LLKHF_UP) != 0;
+      const uint16_t evdev = keymap::fromWindows(k->vkCode, k->scanCode, (k->flags & LLKHF_EXTENDED) != 0);
+      bool swallow;
+      if (evdev == 0 || evdev >= g_hook->keysDown_.size()) {
+        swallow = sink->isRemote();  // no equivalent on the slave: just keep it away from this PC
+      } else {
+        int value = 0;
+        if (!up) value = g_hook->keysDown_.test(evdev) ? 2 : 1;
+        g_hook->keysDown_.set(evdev, !up);
+        swallow = sink->onKey(evdev, value);
+      }
+      if (swallow) return 1;
+    }
+  }
+  return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+LRESULT CALLBACK WinInputHook::mouseProc(int code, WPARAM wParam, LPARAM lParam) {
   if (code == HC_ACTION && g_hook) {
     const auto* m = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-    IMouseSink* sink = g_hook->sink_;
+    IInputSink* sink = g_hook->sink_;
     bool swallow = false;
     switch (wParam) {
       case WM_MOUSEMOVE:

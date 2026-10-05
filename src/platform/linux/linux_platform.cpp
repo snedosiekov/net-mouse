@@ -117,7 +117,14 @@ uint16_t evdevButton(uint8_t button) {
   }
 }
 
-enum : uint8_t { kLeftCtrl = 1, kRightCtrl = 2, kLeftAlt = 4, kRightAlt = 8 };
+bool anyKeyHeld(int fd) {
+  unsigned long state[longsFor(KEY_MAX)] = {};
+  if (ioctl(fd, EVIOCGKEY(sizeof(state)), state) < 0) return false;
+  for (unsigned long word : state) {
+    if (word) return true;
+  }
+  return false;
+}
 
 }  // namespace
 
@@ -203,6 +210,14 @@ void LinuxInjector::button(uint8_t button, bool down) {
   if (const uint16_t code = evdevButton(button)) device_.button(code, down);
 }
 
+void LinuxInjector::key(uint16_t code, int value) {
+  if (dryRun_) {
+    log::info(log::fmt("[dry-run] key %u %s", code, value == 0 ? "up" : (value == 2 ? "repeat" : "down")));
+    return;
+  }
+  device_.key(code, value);
+}
+
 void LinuxInjector::wheel(int delta, bool horizontal) {
   if (dryRun_) {
     log::info(log::fmt("[dry-run] %s wheel %d", horizontal ? "horizontal" : "vertical", delta));
@@ -261,7 +276,7 @@ std::vector<InputDeviceInfo> listInputDevices() {
 // ---------------------------------------------------------------------------------------------
 // Master capture
 
-bool EvdevCapture::start(IMouseSink* sink, std::string& error) {
+bool EvdevCapture::start(IInputSink* sink, std::string& error) {
   sink_ = sink;
   if (pipe2(wakePipe_, O_CLOEXEC | O_NONBLOCK) != 0) {
     error = std::string("pipe2 failed: ") + std::strerror(errno);
@@ -301,8 +316,19 @@ void EvdevCapture::scanDevices() {
       ::close(fd);
       continue;
     }
-    if (p.mouse && ioctl(fd, EVIOCGRAB, 1) != 0) {
-      log::info(log::fmt("Cannot grab mouse '%s' (%s): %s", p.name.c_str(), path.c_str(), std::strerror(errno)));
+    // Keyboards are only taken over when their keys can be passed back to the system.
+    if (!p.mouse && !passthrough_.isOpen()) {
+      ::close(fd);
+      continue;
+    }
+    // Grabbing while a key is held would hide its release from the desktop (the key would repeat
+    // forever there); try again on the next scan.
+    if (anyKeyHeld(fd)) {
+      ::close(fd);
+      continue;
+    }
+    if (ioctl(fd, EVIOCGRAB, 1) != 0) {
+      log::info(log::fmt("Cannot grab '%s' (%s): %s", p.name.c_str(), path.c_str(), std::strerror(errno)));
       ::close(fd);
       continue;
     }
@@ -314,15 +340,14 @@ void EvdevCapture::scanDevices() {
     d.keyboard = p.keyboard;
     d.hiResWheel = p.hiResWheel;
     d.hiResHWheel = p.hiResHWheel;
-    log::info(log::fmt("Using %s '%s' (%s)", p.mouse ? "mouse" : "keyboard (hotkey only)", p.name.c_str(),
-                       path.c_str()));
+    log::info(log::fmt("Using %s '%s' (%s)", p.mouse ? "mouse" : "keyboard", p.name.c_str(), path.c_str()));
     devices_.push_back(std::move(d));
   }
 }
 
 void EvdevCapture::closeDevice(Device& d) {
   if (d.fd < 0) return;
-  if (d.mouse) ioctl(d.fd, EVIOCGRAB, 0);
+  ioctl(d.fd, EVIOCGRAB, 0);
   ::close(d.fd);
   d.fd = -1;
 }
@@ -405,7 +430,7 @@ void EvdevCapture::handleEvent(Device& d, uint16_t type, uint16_t code, int32_t 
       if (code >= BTN_MOUSE && code < BTN_JOYSTICK) {
         if (value != 2) mouseButton(code, value != 0);
       } else {
-        passthrough_.key(code, value);  // keys on a grabbed mouse must still reach the system
+        key(code, value);  // some mice have keys
       }
       return;
     }
@@ -416,32 +441,13 @@ void EvdevCapture::handleEvent(Device& d, uint16_t type, uint16_t code, int32_t 
     }
     return;
   }
+  if (d.keyboard && type == EV_KEY) key(code, value);
+}
 
-  if (d.keyboard && type == EV_KEY) {
-    uint8_t bit = 0;
-    switch (code) {
-      case KEY_LEFTCTRL:
-        bit = kLeftCtrl;
-        break;
-      case KEY_RIGHTCTRL:
-        bit = kRightCtrl;
-        break;
-      case KEY_LEFTALT:
-        bit = kLeftAlt;
-        break;
-      case KEY_RIGHTALT:
-        bit = kRightAlt;
-        break;
-      default:
-        break;
-    }
-    if (bit) {
-      modifiers_ = value ? (modifiers_ | bit) : (modifiers_ & static_cast<uint8_t>(~bit));
-    } else if (code == KEY_HOME && value == 1 && (modifiers_ & (kLeftCtrl | kRightCtrl)) &&
-               (modifiers_ & (kLeftAlt | kRightAlt))) {
-      sink_->onPanic();
-    }
-  }
+void EvdevCapture::key(uint16_t code, int32_t value) {
+  // The engine sends it to the slave that has the pointer (or the one that got the press);
+  // otherwise it goes back to this PC through the virtual device.
+  if (!sink_->onKey(code, value)) passthrough_.key(code, value);
 }
 
 void EvdevCapture::motion(int dx, int dy) {

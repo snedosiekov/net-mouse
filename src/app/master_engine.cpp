@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <random>
 
+#include "core/keymap.h"
 #include "core/log.h"
 #include "core/udp.h"
 
@@ -113,6 +114,44 @@ bool MasterEngine::onMouseWheel(int delta, bool horizontal) {
   return true;
 }
 
+bool MasterEngine::onKey(uint16_t code, int value) {
+  std::lock_guard lock(mutex_);
+  if (value == 0) {
+    // A release goes wherever the press went, even if the pointer has moved since.
+    auto it = keyOwner_.find(code);
+    const uint64_t owner = it != keyOwner_.end() ? it->second : (remote_ ? target_ : 0);
+    if (it != keyOwner_.end()) keyOwner_.erase(it);
+    if (owner == 0) return false;
+    sendKeyLocked(owner, code, 0);
+    return true;
+  }
+
+  // Ctrl+Alt+Home: while keys are swallowed the OS hotkey cannot fire, so detect it here.
+  if (value == 1 && code == keymap::kKeyHome && remote_ &&
+      (heldLocked(keymap::kKeyLeftCtrl) || heldLocked(keymap::kKeyRightCtrl)) &&
+      (heldLocked(keymap::kKeyLeftAlt) || heldLocked(keymap::kKeyRightAlt))) {
+    log::info("Emergency hotkey: pointer returned to the master");
+    leaveRemoteLocked(returnPoint_);  // the slave releases its keys when it gets the Leave
+    return true;
+  }
+
+  uint64_t owner = remote_ ? target_ : 0;
+  auto it = keyOwner_.find(code);
+  if (value == 2 && it != keyOwner_.end()) {
+    owner = it->second;  // auto-repeat follows the press
+  } else {
+    keyOwner_[code] = owner;
+  }
+  if (owner == 0) return false;
+  sendKeyLocked(owner, code, value);
+  return true;
+}
+
+bool MasterEngine::isRemote() const {
+  std::lock_guard lock(mutex_);
+  return remote_;
+}
+
 void MasterEngine::onPanic() {
   std::lock_guard lock(mutex_);
   if (remote_) {
@@ -157,10 +196,34 @@ void MasterEngine::sendPointerLocked(int16_t wheelV, int16_t wheelH, int repeats
   proto::Packet p;
   p.sender = options_.id;
   p.seq = ++seq_;
-  p.body = proto::Pointer{target_, virtual_, remoteButtons_, wheelV, wheelH};
+  p.body = proto::Pointer{target_, virtual_, remoteButtons_, wheelV, wheelH, true, keysOfLocked(target_)};
   const auto bytes = proto::encode(p);
   const uint32_t ip = targetIpLocked();
   for (int i = 0; i < repeats; ++i) transport_.send(bytes, ip);
+}
+
+void MasterEngine::sendKeyLocked(uint64_t slaveId, uint16_t code, int value) {
+  proto::Packet p;
+  p.sender = options_.id;
+  p.seq = ++seq_;
+  p.body = proto::Key{slaveId, code, static_cast<uint8_t>(value), keysOfLocked(slaveId)};
+  const auto bytes = proto::encode(p);
+  const uint32_t ip = slaveIpLocked(slaveId);
+  // Presses and releases are sent twice (duplicates are dropped by sequence number); repeats once.
+  for (int i = 0; i < (value == 2 ? 1 : kReliableRepeats); ++i) transport_.send(bytes, ip);
+}
+
+proto::KeySet MasterEngine::keysOfLocked(uint64_t owner) const {
+  proto::KeySet keys;
+  for (const auto& [code, keyOwner] : keyOwner_) {
+    if (keyOwner == owner && owner != 0) keys.set(code, true);
+  }
+  return keys;
+}
+
+uint32_t MasterEngine::slaveIpLocked(uint64_t slaveId) {
+  const Slave* s = findSlaveLocked(slaveId);
+  return s ? s->ip : kRouteDefault;
 }
 
 void MasterEngine::sendLeaveLocked() {
@@ -174,10 +237,7 @@ void MasterEngine::sendLeaveLocked() {
   for (int i = 0; i < kReliableRepeats; ++i) transport_.send(bytes, ip);
 }
 
-uint32_t MasterEngine::targetIpLocked() {
-  const Slave* s = findSlaveLocked(target_);
-  return s ? s->ip : kRouteDefault;
-}
+uint32_t MasterEngine::targetIpLocked() { return slaveIpLocked(target_); }
 
 Point MasterEngine::parkPointLocked() const {
   for (const MonitorInfo& m : monitors_) {

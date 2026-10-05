@@ -44,7 +44,11 @@ class SlaveEngine {
 
  private:
   void sendHelloLocked();
-  void handlePointerLocked(const proto::Pointer& p, uint32_t seq, uint64_t nowMs);
+  bool acceptSeqLocked(uint32_t seq);
+  void handlePointerLocked(const proto::Pointer& p, uint64_t nowMs);
+  void handleKeyLocked(const proto::Key& k);
+  void releaseKeysNotInLocked(const proto::KeySet& held);
+  bool keyHeldLocked() const;
   void deactivateLocked();
   Point clampToMonitorsLocked(Point p) const;
 
@@ -71,6 +75,7 @@ class SlaveEngine {
   bool havePos_ = false;
   Point lastPos_;
   uint8_t buttons_ = 0;
+  proto::KeySet keys_;  // keys this slave has pressed and not released yet
   uint64_t lastPointerMs_ = 0;
 
   uint64_t lastHelloMs_ = 0;

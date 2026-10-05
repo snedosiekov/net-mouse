@@ -41,16 +41,22 @@ class IInjector {
   virtual void moveTo(Point p) = 0;
   virtual void button(uint8_t button, bool down) = 0;  // a single proto::Button bit
   virtual void wheel(int delta, bool horizontal) = 0;
+  // code: Linux evdev key code; value: 0 = release, 1 = press, 2 = auto-repeat.
+  virtual void key(uint16_t code, int value) = 0;
 };
 
-// Receives raw mouse events captured on the master. Return true to swallow the event so the local
-// system never sees it.
-class IMouseSink {
+// Receives raw mouse and keyboard events captured on the master. Return true to swallow the event
+// so the local system never sees it.
+class IInputSink {
  public:
-  virtual ~IMouseSink() = default;
+  virtual ~IInputSink() = default;
   virtual bool onMouseMove(Point pt) = 0;
   virtual bool onMouseButton(uint8_t button, bool down) = 0;
   virtual bool onMouseWheel(int delta, bool horizontal) = 0;
+  // code: Linux evdev key code; value: 0 = release, 1 = press, 2 = auto-repeat.
+  virtual bool onKey(uint16_t code, int value) = 0;
+  // True while the pointer is on a slave (keys without an evdev code are then swallowed).
+  virtual bool isRemote() const = 0;
   virtual void onPanic() = 0;  // emergency hotkey: return the pointer to the master
 };
 

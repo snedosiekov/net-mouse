@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <bitset>
 #include <thread>
 
 #include "platform/platform.h"
@@ -29,27 +30,31 @@ class WinInjector : public IInjector {
   void moveTo(Point p) override;
   void button(uint8_t button, bool down) override;
   void wheel(int delta, bool horizontal) override;
+  void key(uint16_t code, int value) override;
 
  private:
   bool dryRun_;
 };
 
-// Global low-level mouse hook (WH_MOUSE_LL) on a dedicated high-priority thread, plus the
-// emergency hotkey Ctrl+Alt+Home.
-class WinMouseHook {
+// Global low-level mouse and keyboard hooks (WH_MOUSE_LL, WH_KEYBOARD_LL) on a dedicated
+// high-priority thread, plus the emergency hotkey Ctrl+Alt+Home (for when keys are not swallowed).
+class WinInputHook {
  public:
-  ~WinMouseHook() { stop(); }
-  bool start(IMouseSink* sink);
+  ~WinInputHook() { stop(); }
+  bool start(IInputSink* sink);
   void stop();
 
  private:
-  static LRESULT CALLBACK hookProc(int code, WPARAM wParam, LPARAM lParam);
+  static LRESULT CALLBACK mouseProc(int code, WPARAM wParam, LPARAM lParam);
+  static LRESULT CALLBACK keyboardProc(int code, WPARAM wParam, LPARAM lParam);
   void run(void* ready);
 
-  IMouseSink* sink_ = nullptr;
+  IInputSink* sink_ = nullptr;
   std::thread thread_;
   DWORD threadId_ = 0;
-  HHOOK hook_ = nullptr;
+  HHOOK mouseHook_ = nullptr;
+  HHOOK keyboardHook_ = nullptr;
+  std::bitset<1024> keysDown_;  // by evdev code, to tell auto-repeat from a new press
 };
 
 }  // namespace nm

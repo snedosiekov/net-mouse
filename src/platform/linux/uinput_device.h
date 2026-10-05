@@ -20,8 +20,8 @@ class UinputDevice {
  public:
   ~UinputDevice() { close(); }
 
-  // bounds: desktop area the absolute range covers. withKeys: the companion device also declares
-  // keyboard keys, so keys coming from a grabbed mouse (some mice have them) can be passed through.
+  // bounds: desktop area the absolute range covers. withKeys: the companion device also acts as a
+  // keyboard (keys from the master on a slave; passed-through local keys on a master).
   bool open(const std::string& name, const Rect& bounds, bool withKeys, std::string& error);
   void close();
   bool isOpen() const { return pointerFd_ >= 0; }

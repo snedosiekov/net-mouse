@@ -90,7 +90,10 @@ bool UinputDevice::open(const std::string& name, const Rect& bounds, bool withKe
     ok = ok && set(fd, UI_SET_KEYBIT, BTN_LEFT);
     for (int code = BTN_SIDE; code <= BTN_TASK; ++code) ok = ok && set(fd, UI_SET_KEYBIT, code);
     if (withKeys) {
-      for (int code = KEY_ESC; code <= KEY_MICMUTE; ++code) ok = ok && set(fd, UI_SET_KEYBIT, code);
+      // Keyboard keys (1..255) and the extended keys from KEY_OK on, but not the joystick
+      // "trigger happy" buttons at 0x2c0 and above, which would make it look like a gamepad.
+      for (int code = KEY_ESC; code <= 255; ++code) ok = ok && set(fd, UI_SET_KEYBIT, code);
+      for (int code = KEY_OK; code < 0x2c0; ++code) ok = ok && set(fd, UI_SET_KEYBIT, code);
     }
     return ok;
   }, error);

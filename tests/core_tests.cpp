@@ -9,6 +9,7 @@
 #include "app/master_engine.h"
 #include "app/slave_engine.h"
 #include "core/config.h"
+#include "core/keymap.h"
 #include "core/layout.h"
 #include "core/protocol.h"
 
@@ -49,9 +50,11 @@ struct FakeInjector : IInjector {
   std::vector<Point> moves;
   std::vector<std::pair<uint8_t, bool>> buttons;
   std::vector<int> wheels;
+  std::vector<std::pair<uint16_t, int>> keys;
   void moveTo(Point p) override { moves.push_back(p); }
   void button(uint8_t b, bool down) override { buttons.push_back({b, down}); }
   void wheel(int d, bool) override { wheels.push_back(d); }
+  void key(uint16_t code, int value) override { keys.push_back({code, value}); }
 };
 
 template <typename Engine>
@@ -77,7 +80,7 @@ void testProtocol() {
   CHECK(h && h->name == "pc-2" && h->monitors.size() == 2 && h->monitors[1].left == -1280 &&
         h->masterId == 42 && h->configVersion == 7);
 
-  p.body = proto::Pointer{9, {-5, 70000}, proto::kButtonLeft | proto::kButtonX2, -120, 240};
+  p.body = proto::Pointer{9, {-5, 70000}, proto::kButtonLeft | proto::kButtonX2, -120, 240, true, {}};
   bytes = proto::encode(p);
   d = proto::decode(bytes.data(), bytes.size());
   const auto* ptr = d ? std::get_if<proto::Pointer>(&d->body) : nullptr;
@@ -263,6 +266,118 @@ void testMultiHomedSlave() {
   std::filesystem::remove(std::filesystem::temp_directory_path() / "nm_test_multihomed.ini");
 }
 
+void testKeymap() {
+  using namespace keymap;
+  CHECK(fromWindows(0x41, 0x1E, false) == 30);   // A
+  CHECK(fromWindows(0x7B, 0x58, false) == 88);   // F12
+  CHECK(fromWindows(0xA3, 0x1D, true) == 97);    // Right Ctrl
+  CHECK(fromWindows(0x26, 0x48, true) == 103);   // Up
+  CHECK(fromWindows(0x13, 0x45, false) == 119);  // Pause
+  CHECK(fromWindows(0x90, 0x45, true) == 69);    // NumLock (reported as extended)
+  CHECK(fromWindows(0xA2, 0x21D, false) == 0);   // fake Left Ctrl sent with AltGr
+  CHECK(fromWindows(0xAF, 0, false) == 115);     // Volume Up without a scan code
+  WinKey wk;
+  CHECK(toWindows(30, wk) && wk.scan == 0x1E && !wk.extended && wk.vk == 0);
+  CHECK(toWindows(103, wk) && wk.scan == 0x48 && wk.extended);
+  CHECK(toWindows(119, wk) && wk.vk == 0x13);
+  CHECK(toWindows(69, wk) && wk.vk == 0x90 && wk.extended);
+  // Every key Windows can report survives the round trip to an injectable key.
+  for (uint32_t scan = 1; scan <= 0x58; ++scan) {
+    const uint16_t code = fromWindows(0, scan, false);
+    if (code) CHECK(toWindows(code, wk));
+  }
+}
+
+void testKeyProtocol() {
+  proto::Packet p;
+  p.sender = 5;
+  p.seq = 9;
+  proto::KeySet held;
+  held.set(29, true);
+  held.set(30, true);
+  p.body = proto::Key{77, 30, 1, held};
+  auto bytes = proto::encode(p);
+  auto d = proto::decode(bytes.data(), bytes.size());
+  const auto* k = d ? std::get_if<proto::Key>(&d->body) : nullptr;
+  CHECK(k && k->target == 77 && k->code == 30 && k->value == 1 && k->held.has(29) && k->held.has(30) &&
+        !k->held.has(31));
+
+  p.body = proto::Pointer{77, {1, 2}, 0, 0, 0, true, held};
+  bytes = proto::encode(p);
+  d = proto::decode(bytes.data(), bytes.size());
+  const auto* ptr = d ? std::get_if<proto::Pointer>(&d->body) : nullptr;
+  CHECK(ptr && ptr->hasKeys && ptr->keys == held);
+  // A pointer from an older master (no key set) still decodes, without keys.
+  d = proto::decode(bytes.data(), bytes.size() - sizeof(proto::KeySet::bits));
+  ptr = d ? std::get_if<proto::Pointer>(&d->body) : nullptr;
+  CHECK(ptr && !ptr->hasKeys);
+}
+
+void testKeyboardSession() {
+  auto dir = std::filesystem::temp_directory_path();
+  Config masterCfg, slaveCfg;
+  masterCfg.load(dir / "nm_test_kb_master.ini");
+  slaveCfg.load(dir / "nm_test_kb_slave.ini");
+  FakeTransport masterNet, slaveNet;
+  FakeDisplays masterDisplays, slaveDisplays;
+  masterDisplays.list = {{{0, 0, 1920, 1080}, true, "M1"}};
+  slaveDisplays.list = {{{0, 0, 1920, 1080}, true, "S1"}};
+  FakeCursor cursor;
+  FakeInjector injector;
+  MasterEngine master({1, "master", true}, masterCfg, masterNet, masterDisplays, cursor);
+  SlaveEngine slave({2, "slave"}, slaveCfg, slaveNet, slaveDisplays, injector);
+  uint64_t now = 10'000;
+  slave.tick(now);
+  deliver(slaveNet, master, now);
+  deliver(masterNet, slave, now);
+  deliver(slaveNet, master, now);
+
+  constexpr uint16_t A = 30, S = 31, SHIFT = 42, CTRL = 29, ALT = 56, HOME = 102;
+  // Pointer on the master: keys stay local.
+  CHECK(!master.onKey(A, 1) && !master.onKey(A, 0));
+
+  // Shift pressed locally, then the pointer crosses: the Shift release must stay local.
+  CHECK(!master.onKey(SHIFT, 1));
+  CHECK(master.onMouseMove({1919, 500}));
+  CHECK(master.onKey(A, 1) && master.onKey(A, 2) && master.onKey(A, 0));
+  CHECK(!master.onKey(SHIFT, 0));
+  deliver(masterNet, slave, now);
+  CHECK((injector.keys == std::vector<std::pair<uint16_t, int>>{{A, 1}, {A, 2}, {A, 0}}));
+
+  // Ctrl pressed on the slave, pointer comes back: the slave releases it, the late release still
+  // goes to the slave (where it is ignored), never to the master.
+  injector.keys.clear();
+  CHECK(master.onKey(CTRL, 1));
+  CHECK(master.onMouseMove({960 - 100, 540}));  // back to the master
+  CHECK(!master.snapshot().remote);
+  CHECK(master.onKey(CTRL, 0));
+  deliver(masterNet, slave, now);
+  CHECK((injector.keys == std::vector<std::pair<uint16_t, int>>{{CTRL, 1}, {CTRL, 0}}));
+
+  // A lost release is repaired by the next heartbeat's key set.
+  injector.keys.clear();
+  CHECK(master.onMouseMove({1919, 500}));
+  CHECK(master.onKey(S, 1));
+  deliver(masterNet, slave, now);
+  CHECK(master.onKey(S, 0));
+  masterNet.sent.clear();  // the release never arrives
+  now += 200;
+  master.tick(now);  // heartbeat
+  deliver(masterNet, slave, now);
+  CHECK((injector.keys == std::vector<std::pair<uint16_t, int>>{{S, 1}, {S, 0}}));
+
+  // Ctrl+Alt+Home while on the slave returns the pointer; Home itself is not sent.
+  injector.keys.clear();
+  CHECK(master.onKey(CTRL, 1) && master.onKey(ALT, 1));
+  CHECK(master.onKey(HOME, 1));
+  CHECK(!master.snapshot().remote);
+  deliver(masterNet, slave, now);
+  for (const auto& [code, value] : injector.keys) CHECK(code != HOME);
+  CHECK(!injector.keys.empty() && injector.keys.back().second == 0);  // Leave released Ctrl/Alt
+  std::filesystem::remove(dir / "nm_test_kb_master.ini");
+  std::filesystem::remove(dir / "nm_test_kb_slave.ini");
+}
+
 }  // namespace
 
 int main() {
@@ -271,6 +386,9 @@ int main() {
   testConfig();
   testSession();
   testMultiHomedSlave();
+  testKeymap();
+  testKeyProtocol();
+  testKeyboardSession();
   if (g_failures == 0) std::printf("All tests passed\n");
   return g_failures == 0 ? 0 : 1;
 }

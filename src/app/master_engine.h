@@ -7,6 +7,7 @@
 // snapshot/setSlaveOffset on the UI thread. One mutex guards all state.
 
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -38,7 +39,7 @@ struct MasterSnapshot {
   Point virtualPos;
 };
 
-class MasterEngine : public IMouseSink {
+class MasterEngine : public IInputSink {
  public:
   struct Options {
     uint64_t id = 0;
@@ -49,10 +50,12 @@ class MasterEngine : public IMouseSink {
   MasterEngine(Options options, Config& config, ITransport& transport, IDisplays& displays,
                ICursor& cursor);
 
-  // IMouseSink (capture thread)
+  // IInputSink (capture thread)
   bool onMouseMove(Point pt) override;
   bool onMouseButton(uint8_t button, bool down) override;
   bool onMouseWheel(int delta, bool horizontal) override;
+  bool onKey(uint16_t code, int value) override;
+  bool isRemote() const override;
   void onPanic() override;
 
   // Network thread
@@ -85,6 +88,10 @@ class MasterEngine : public IMouseSink {
   void leaveRemoteLocked(Point at);
   void sendPointerLocked(int16_t wheelV, int16_t wheelH, int repeats);
   void sendLeaveLocked();
+  void sendKeyLocked(uint64_t slaveId, uint16_t code, int value);
+  proto::KeySet keysOfLocked(uint64_t owner) const;
+  bool heldLocked(uint16_t code) const { return keyOwner_.count(code) != 0; }
+  uint32_t slaveIpLocked(uint64_t slaveId);
   uint32_t targetIpLocked();
   Point parkPointLocked() const;
 
@@ -109,6 +116,9 @@ class MasterEngine : public IMouseSink {
   Point returnPoint_;  // where to put the cursor back if the slave disappears
   uint8_t remoteButtons_ = 0;
   bool cursorHidden_ = false;
+  // Every held key and where its press went (0 = this PC): the release must go to the same place,
+  // even if the pointer moved to another screen in between.
+  std::map<uint16_t, uint64_t> keyOwner_;
 
   uint64_t lastAnnounceMs_ = 0;
   uint64_t lastMonitorRefreshMs_ = 0;

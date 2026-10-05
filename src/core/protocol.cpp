@@ -38,6 +38,7 @@ class Writer {
     i32(r.right);
     i32(r.bottom);
   }
+  void keys(const KeySet& k) { buf.insert(buf.end(), k.bits.begin(), k.bits.end()); }
 
   std::vector<uint8_t> buf;
 };
@@ -90,6 +91,11 @@ class Reader {
     p.y = i32();
     return p;
   }
+  KeySet keys() {
+    KeySet k;
+    for (uint8_t& b : k.bits) b = u8();
+    return k;
+  }
   Rect rect() {
     Rect r;
     r.left = i32();
@@ -138,8 +144,14 @@ std::vector<uint8_t> encode(const Packet& packet) {
           w.u8(m.buttons);
           w.i16(m.wheelV);
           w.i16(m.wheelH);
+          w.keys(m.keys);  // appended field: older decoders ignore trailing bytes
         } else if constexpr (std::is_same_v<T, Leave>) {
           w.u64(m.target);
+        } else if constexpr (std::is_same_v<T, Key>) {
+          w.u64(m.target);
+          w.u16(m.code);
+          w.u8(m.value);
+          w.keys(m.held);
         }
       },
       packet.body);
@@ -168,7 +180,7 @@ std::optional<Packet> decode(const uint8_t* data, size_t size) {
       const size_t n = r.u8();
       if (n > kMaxMonitors) return std::nullopt;
       for (size_t i = 0; i < n && r.ok(); ++i) m.monitors.push_back(r.rect());
-      if (r.remaining() >= 4) m.address = r.u32();  // absent in hellos from older slaves
+      if (r.remaining() != 0) m.address = r.u32();  // absent in hellos from older slaves; never partial
       p.body = std::move(m);
       break;
     }
@@ -187,12 +199,25 @@ std::optional<Packet> decode(const uint8_t* data, size_t size) {
       m.buttons = r.u8();
       m.wheelV = r.i16();
       m.wheelH = r.i16();
+      if (r.remaining() != 0) {  // absent in pointers from older masters; never partial
+        m.hasKeys = true;
+        m.keys = r.keys();
+      }
       p.body = m;
       break;
     }
     case 5: {
       Leave m;
       m.target = r.u64();
+      p.body = m;
+      break;
+    }
+    case 6: {
+      Key m;
+      m.target = r.u64();
+      m.code = r.u16();
+      m.value = r.u8();
+      m.held = r.keys();
       p.body = m;
       break;
     }

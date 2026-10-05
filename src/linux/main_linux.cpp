@@ -313,7 +313,7 @@ int main(int argc, char** argv) {
   for (const MonitorInfo& m : displays.monitors()) rects.push_back(m.rect);
   UinputDevice device;
   const bool needDevice = role == "master" || !args.dryRun;
-  if (needDevice && !device.open("net-mouse " + role + " pointer", boundingRect(rects), role == "master", error)) {
+  if (needDevice && !device.open("net-mouse " + role + " pointer", boundingRect(rects), true, error)) {
     log::info("Cannot create the virtual pointer: " + error);
     return 1;
   }

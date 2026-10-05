@@ -20,6 +20,7 @@ endif()
 # Platform-independent core: protocol, layout, config, networking and the master/slave engines.
 add_library(nm_core STATIC
   src/core/protocol.cpp
+  src/core/keymap.cpp
   src/core/layout.cpp
   src/core/config.cpp
   src/core/log.cpp

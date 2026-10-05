@@ -77,7 +77,7 @@ struct App {
   std::unique_ptr<WinInjector> injector;
   std::unique_ptr<MasterEngine> master;
   std::unique_ptr<SlaveEngine> slave;
-  WinMouseHook hook;
+  WinInputHook hook;
   std::thread netThread;
   std::atomic<bool> running{true};
 

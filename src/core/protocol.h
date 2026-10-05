@@ -3,6 +3,7 @@
 // Wire protocol. All packets go to one UDP multicast group; every packet starts with a header
 // (magic, version, type, sender id, sequence number). Integers are little-endian.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -49,6 +50,20 @@ struct SlaveConfig {
   Point offset;
 };
 
+// Keys held for one slave: Linux (evdev) key codes below 256 as a 256-bit mask. Sent with every key
+// event and pointer heartbeat, so a slave can release keys whose release packet was lost.
+struct KeySet {
+  std::array<uint8_t, 32> bits{};
+
+  bool has(uint16_t code) const { return code < 256 && ((bits[code >> 3] >> (code & 7)) & 1) != 0; }
+  void set(uint16_t code, bool held) {
+    if (code >= 256) return;
+    const uint8_t mask = static_cast<uint8_t>(1u << (code & 7));
+    bits[code >> 3] = held ? (bits[code >> 3] | mask) : (bits[code >> 3] & static_cast<uint8_t>(~mask));
+  }
+  friend bool operator==(const KeySet&, const KeySet&) = default;
+};
+
 // Master -> slave: complete pointer state in master layout coordinates.
 struct Pointer {
   uint64_t target = 0;
@@ -56,6 +71,8 @@ struct Pointer {
   uint8_t buttons = 0;  // Button bit mask
   int16_t wheelV = 0;   // wheel delta carried by this packet (WHEEL_DELTA units)
   int16_t wheelH = 0;
+  bool hasKeys = false;  // appended field; false in packets from masters without keyboard support
+  KeySet keys;           // keys currently held for this slave
 };
 
 // Master -> slave: the pointer left this slave.
@@ -63,8 +80,17 @@ struct Leave {
   uint64_t target = 0;
 };
 
+// Master -> slave: a key event. Codes are Linux evdev key codes (KEY_A = 30, ...), i.e. physical key
+// positions: the slave's own keyboard layout decides which character they produce.
+struct Key {
+  uint64_t target = 0;
+  uint16_t code = 0;
+  uint8_t value = 0;  // 0 = release, 1 = press, 2 = auto-repeat
+  KeySet held;        // keys held for this slave after this event
+};
+
 // Variant order defines the on-wire type id (index + 1).
-using Body = std::variant<MasterAnnounce, SlaveHello, SlaveConfig, Pointer, Leave>;
+using Body = std::variant<MasterAnnounce, SlaveHello, SlaveConfig, Pointer, Leave, Key>;
 
 struct Packet {
   uint64_t sender = 0;

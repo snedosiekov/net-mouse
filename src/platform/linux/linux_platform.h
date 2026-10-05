@@ -41,6 +41,7 @@ class LinuxInjector : public IInjector {
   void moveTo(Point p) override;
   void button(uint8_t button, bool down) override;
   void wheel(int delta, bool horizontal) override;
+  void key(uint16_t code, int value) override;
 
  private:
   UinputDevice& device_;
@@ -79,9 +80,9 @@ struct InputDeviceInfo {
 // Classifies /dev/input/event* (diagnostics: net-mouse-daemon --list-devices).
 std::vector<InputDeviceInfo> listInputDevices();
 
-// Master: reads the physical mice (grabbed) and keyboards (not grabbed, only for the emergency
-// hotkey Ctrl+Alt+Home), feeds the engine like the Windows hook does, and passes everything the
-// engine does not swallow back to the system through the virtual device.
+// Master: grabs the physical mice and keyboards, feeds the engine like the Windows hooks do, and
+// passes everything the engine does not swallow (i.e. everything while the pointer is on this PC)
+// back to the system through the virtual device. If the daemon stops, the kernel releases the grabs.
 class EvdevCapture {
  public:
   struct Options {
@@ -93,7 +94,7 @@ class EvdevCapture {
       : options_(options), displays_(displays), cursor_(cursor), passthrough_(passthrough) {}
   ~EvdevCapture() { stop(); }
 
-  bool start(IMouseSink* sink, std::string& error);
+  bool start(IInputSink* sink, std::string& error);
   void stop();
 
  private:
@@ -116,12 +117,13 @@ class EvdevCapture {
   void motion(int dx, int dy);
   void mouseButton(uint16_t code, bool down);
   void wheel(int delta, bool horizontal);
+  void key(uint16_t code, int32_t value);
 
   Options options_;
   IDisplays& displays_;
   LinuxCursor& cursor_;
   UinputDevice& passthrough_;
-  IMouseSink* sink_ = nullptr;
+  IInputSink* sink_ = nullptr;
 
   std::thread thread_;
   std::atomic<bool> running_{false};
@@ -129,8 +131,6 @@ class EvdevCapture {
   std::vector<Device> devices_;
   std::vector<layout::Screen> masterScreens_;
   double remX_ = 0;
-  double remY_ = 0;
-  uint8_t modifiers_ = 0;  // held Ctrl/Alt keys, for the emergency hotkey
-};
+  double remY_ = 0;};
 
 }  // namespace nm
