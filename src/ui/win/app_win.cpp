@@ -35,6 +35,7 @@
 #include "core/udp.h"
 #include "platform/win/win_platform.h"
 #include "ui/win/layout_view.h"
+#include "ui/win/network_dialog.h"
 #include "ui/win/resource_ids.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -51,7 +52,7 @@ constexpr wchar_t kAppTitle[] = L"Net Mouse";
 constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT kTrayId = 1;
-enum : UINT { IDM_SHOW = 100, IDM_RETURN, IDM_CHANGE_ROLE, IDM_FORGET_MASTER, IDM_DISCONNECT, IDM_EXIT };
+enum : UINT { IDM_SHOW = 100, IDM_RETURN, IDM_CHANGE_ROLE, IDM_FORGET_MASTER, IDM_DISCONNECT, IDM_EXIT, IDM_NETWORK };
 
 constexpr char kDefaultGroup[] = "239.255.77.77";
 constexpr int kDefaultPort = 47800;
@@ -269,6 +270,9 @@ std::wstring statusText() {
     }
     if (g.dryRun) t += L"DRY RUN: input is logged, not injected\n";
   }
+  const auto filter = g.net.filter();
+  t += L"Network: " + (filter.empty() ? std::wstring(L"all interfaces") : widen(joinInterfaceList(filter))) +
+       L"  (tray menu \u2192 Network\u2026)\n";
   t += L"\nRecent events:\n";
   for (const std::string& line : log::recent(6)) t += widen(line) + L"\n";
   return t;
@@ -373,6 +377,7 @@ void showTrayMenu() {
   AppendMenuW(menu, MF_STRING, IDM_SHOW, g.master ? L"Arrange displays…" : L"Status…");
   if (g.master) AppendMenuW(menu, MF_STRING, IDM_RETURN, L"Return pointer to this PC\tCtrl+Alt+Home");
   if (g.slave && g.slave->snapshot().paired) AppendMenuW(menu, MF_STRING, IDM_FORGET_MASTER, L"Forget master…");
+  AppendMenuW(menu, MF_STRING, IDM_NETWORK, L"Network…");
   AppendMenuW(menu, MF_STRING, IDM_CHANGE_ROLE, L"Change role…");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Close Net Mouse");
@@ -586,6 +591,15 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDM_DISCONNECT:
           disconnectSlave(hwnd, g.menuSlave);
           break;
+        case IDM_NETWORK:
+          if (auto selection = ui::showNetworkDialog(hwnd, g.net.choices(), g.net.filter().empty(), g.font, g.dpi)) {
+            g.config.set("interfaces", joinInterfaceList(*selection));
+            g.config.erase("interface");
+            g.config.save();
+            g.net.setFilter(*selection);  // takes effect immediately
+            InvalidateRect(hwnd, nullptr, FALSE);
+          }
+          break;
         case IDM_FORGET_MASTER:
           if (g.slave && MessageBoxW(hwnd,
                                      L"Forget the master this PC is paired with?\n\nIt will no longer control this PC "
@@ -720,7 +734,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   g.port = static_cast<int>(g.config.getInt("port", kDefaultPort));
   if (!g.config.has("group")) g.config.set("group", g.group);
   if (!g.config.has("port")) g.config.setInt("port", g.port);
-  if (!g.config.has("interface")) g.config.set("interface", "");
+  if (!g.config.has("interfaces")) g.config.set("interfaces", "");
   if (g.role == "master" && !g.config.has("hide_cursor")) g.config.setInt("hide_cursor", 1);
   g.showTrayHint = g.config.getInt("tray_hint_shown", 0) == 0;
   g.config.setInt("tray_hint_shown", 1);
@@ -746,7 +760,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
   }
 
   std::string error;
-  if (!g.net.open(g.group, static_cast<uint16_t>(g.port), g.config.get("interface"), error)) {
+  // Network interfaces to use: "interfaces" (names or addresses; empty = all), or the older
+  // single-address "interface" setting.
+  std::vector<std::string> interfaces = parseInterfaceList(g.config.get("interfaces"));
+  if (interfaces.empty() && !g.config.get("interface").empty()) interfaces.push_back(g.config.get("interface"));
+  if (!g.net.open(g.group, static_cast<uint16_t>(g.port), interfaces, error)) {
     CloseHandle(instanceMutex);
     return fail(L"Network setup failed: " + widen(error));
   }

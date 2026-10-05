@@ -77,6 +77,7 @@ if(WIN32)
   add_executable(net-mouse WIN32
     src/platform/win/win_platform.cpp
     src/ui/win/layout_view.cpp
+    src/ui/win/network_dialog.cpp
     src/ui/win/app_win.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/resources.rc
   )

@@ -162,6 +162,15 @@ class App:
         tk.Button(this_pc, text="Apply role", command=self.apply_role).grid(row=1, column=4, padx=2, pady=(6, 0))
         self.forget_button = tk.Button(this_pc, text="Forget master", command=self.forget_master)
         self.forget_button.grid(row=1, column=3, padx=2, pady=(6, 0))
+        tk.Label(this_pc, text="Network:").grid(row=2, column=0, sticky="nw", pady=(6, 0))
+        self.net_frame = tk.Frame(this_pc)
+        self.net_frame.grid(row=2, column=1, columnspan=3, sticky="w", pady=(6, 0))
+        tk.Button(this_pc, text="Apply network", command=self.apply_interfaces).grid(
+            row=2, column=4, padx=2, pady=(6, 0), sticky="n")
+        self.net_all = tk.BooleanVar(value=True)
+        self.net_boxes = []
+        self.net_vars = {}
+        self.net_signature = None
         this_pc.columnconfigure(1, weight=1)
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
@@ -189,6 +198,7 @@ class App:
                 self.status = None
             if self.status:
                 self.update_texts()
+                self.update_interfaces()
                 if not self.monitors_loaded:
                     self.monitors_var.set(self.status.get("monitor_spec", ""))
                     self.role_var.set(self.status.get("role", ""))
@@ -251,6 +261,44 @@ class App:
         if v and messagebox.askokcancel("Net Mouse", f"Disconnect \"{v['name']}\"?\n\nThis master stops controlling "
                                                      "it; it goes back to Available."):
             self.send(f"unpair {v['id']}")
+
+    def update_interfaces(self):
+        """One checkbox per interface; rebuilt only when the set of interfaces changes."""
+        interfaces = self.status.get("interfaces", [])
+        signature = tuple((i["name"], i["ip"]) for i in interfaces)
+        if signature == self.net_signature:
+            return
+        self.net_signature = signature
+        for child in self.net_frame.winfo_children():
+            child.destroy()
+        self.net_all.set(not self.status.get("interface_filter"))
+        tk.Checkbutton(self.net_frame, text="All interfaces", variable=self.net_all,
+                       command=self.update_interface_state).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.net_vars = {}
+        self.net_boxes = []
+        for n, i in enumerate(interfaces):
+            var = tk.BooleanVar(value=i["selected"])
+            self.net_vars[i["name"]] = var
+            label = f"{i['name']}  \u2014  {i['ip'] if i['up'] else 'not connected'}"
+            box = tk.Checkbutton(self.net_frame, text=label, variable=var)
+            box.grid(row=1 + n // 3, column=n % 3, sticky="w", padx=(16 if n % 3 == 0 else 8, 0))
+            self.net_boxes.append(box)
+        self.update_interface_state()
+
+    def update_interface_state(self):
+        for box in self.net_boxes:
+            box.config(state="disabled" if self.net_all.get() else "normal")
+
+    def apply_interfaces(self):
+        if self.net_all.get():
+            self.send("set-interfaces all")
+            return
+        names = [name for name, var in self.net_vars.items() if var.get()]
+        if not names:
+            messagebox.showerror("Net Mouse", "Select at least one interface, or \"All interfaces\".")
+            return
+        if self.send("set-interfaces " + ", ".join(names)):
+            self.net_signature = None  # show the applied state
 
     def on_detect(self):
         spec = detect_monitors(self.root)

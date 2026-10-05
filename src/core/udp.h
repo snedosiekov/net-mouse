@@ -13,7 +13,7 @@
 namespace nm {
 
 struct NetInterface {
-  uint32_t addr = 0;  // IPv4, host byte order
+  uint32_t addr = 0;  // IPv4, host byte order (0 = not up right now)
   uint32_t mask = 0;
   std::string name;
 };
@@ -25,21 +25,40 @@ std::string ipToString(uint32_t hostOrderIp);
 uint32_t defaultRouteAddress();
 bool parseIp(const std::string& text, uint32_t& hostOrderIp);
 
+// Interface selection as stored in the settings: "Ethernet 5, eno1" (names or IPv4 addresses).
+std::vector<std::string> parseInterfaceList(const std::string& text);
+std::string joinInterfaceList(const std::vector<std::string>& list);
+// True if `entry` names this interface (name, case-insensitive) or is its address.
+bool interfaceMatches(const NetInterface& ni, const std::string& entry);
+
 class UdpMulticast : public ITransport {
  public:
+  struct Choice {
+    NetInterface iface;  // addr == 0: selected in the settings but not up right now
+    bool selected = false;
+  };
+
   UdpMulticast() = default;
   ~UdpMulticast() override;
   UdpMulticast(const UdpMulticast&) = delete;
   UdpMulticast& operator=(const UdpMulticast&) = delete;
 
-  // iface: optional local IPv4 address to pin all traffic to; empty = use every interface.
-  bool open(const std::string& group, uint16_t port, const std::string& iface, std::string& error);
+  // filter: interfaces to use (names or addresses); empty = every interface.
+  bool open(const std::string& group, uint16_t port, const std::vector<std::string>& filter, std::string& error);
   void close();
 
-  // Joins the group on interfaces that appeared since the last call (DHCP, VPN, cable plugged in).
+  // Applies a new interface selection immediately.
+  void setFilter(const std::vector<std::string>& filter);
+  std::vector<std::string> filter() const;
+  // Every interface (and every selected one that is down), with its selection state.
+  std::vector<Choice> choices() const;
+
+  // Joins the group on interfaces that appeared since the last call (DHCP, VPN, cable plugged in)
+  // and leaves it on interfaces that are no longer selected.
   void refreshInterfaces();
 
-  // Waits up to timeoutMs. Returns the datagram size, 0 on timeout/transient error, -1 if closed.
+  // Waits up to timeoutMs. Returns the datagram size, 0 on timeout/transient error or a datagram
+  // from outside the selected networks, -1 if closed.
   int receive(uint8_t* buffer, size_t capacity, uint32_t& sourceIp, int timeoutMs);
 
   void send(const std::vector<uint8_t>& datagram, uint32_t peerIp) override;
@@ -50,15 +69,18 @@ class UdpMulticast : public ITransport {
   bool isLocalSubnetLocked(uint32_t ip) const;
   void setOutgoingLocked(uint32_t ifaceAddr);
   void sendToGroupLocked(const std::vector<uint8_t>& datagram);
+  void sendOnAllActiveLocked(const std::vector<uint8_t>& datagram);
+  bool membershipLocked(uint32_t ifaceAddr, bool join);
 
   intptr_t sock_ = -1;
   uint32_t group_ = 0;
   uint16_t port_ = 0;
-  uint32_t fixedIface_ = 0;
   bool wsaStarted_ = false;
 
   mutable std::mutex mutex_;  // guards everything below plus the socket's outgoing interface option
-  std::vector<NetInterface> interfaces_;
+  std::vector<std::string> filter_;
+  std::vector<NetInterface> all_;         // every interface that is up
+  std::vector<NetInterface> interfaces_;  // the ones in use (all_ when there is no filter)
   std::set<uint32_t> joined_;
   uint32_t currentOutgoing_ = 0xFFFFFFFFu;
   uint32_t primary_ = 0;

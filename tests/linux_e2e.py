@@ -258,6 +258,17 @@ def main():
         check("permission denied" in unprivileged.stdout,
               f"control socket: changes refused for unprivileged users ({(unprivileged.stdout + unprivileged.stderr).strip()})")
 
+        # Interface selection: on an interface that does not exist the slave goes silent and the master
+        # loses it; "all" brings it back. Applied live, without a restart.
+        check(query("slave", "set-interfaces no-such-iface0") == "ok", "set-interfaces accepted")
+        sel = json.loads(query("slave", "status"))
+        check(sel["interface_filter"] == "no-such-iface0" and
+              any(i["name"] == "no-such-iface0" and not i["up"] for i in sel["interfaces"]),
+              "status shows the selection (and that it is not up)")
+        check(wait_for(lambda: not master_slaves()[0]["online"], 8), "slave unreachable outside the selected interfaces")
+        check(query("slave", "set-interfaces all") == "ok", "back to all interfaces")
+        check(wait_for(lambda: master_slaves()[0]["connected"], 8), "slave reconnects without a restart")
+
         # A forged, unencrypted pointer packet claiming to come from the master is ignored.
         slave_id = int(json.loads(query("slave", "status"))["id"], 16)
         master_id = int(status["id"], 16)

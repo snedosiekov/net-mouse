@@ -62,6 +62,8 @@ Startup is enabled by default; add `/MERGETASKS="!autostart"` to install without
    (Linux: `net-mouse-ctl forget-master`) releases it for another master.
 3. Drag the green slave screens to where the PCs physically stand. Edges snap together, and the pointer
    crosses only where screens touch. Right-click a slave screen to disconnect it.
+   If a PC has several networks (VPNs, tunnels), choose the ones Net Mouse may use with *Network…* in
+   the tray menu.
 4. Net Mouse runs minimized in the notification area (system tray). The mouse icon is blue when idle
    and turns orange while the pointer is on a slave (on a slave: while it is being controlled). Its
    tooltip shows the current state. Click the icon to open the window. Minimizing or closing the window
@@ -105,7 +107,7 @@ Testing on a single PC: run a master and a `--dry-run` slave side by side, each 
 | `id` | random | persistent identity of this PC |
 | `name` | computer name | |
 | `group`, `port` | `239.255.77.77`, `47800` | multicast group and UDP port (must match on all PCs) |
-| `interface` | empty | local IPv4 address to pin traffic to; empty = all interfaces |
+| `interfaces` | empty | network interfaces to use, by name or IPv4 address (`Ethernet 5, 10.10.69.150`); empty = all. Set it with *Network…* in the tray menu; takes effect immediately |
 | `hide_cursor` | `1` | master: hide the local cursor while the pointer is on a slave |
 | `slave.<id>.x/.y`, `slave.<id>.key` | | master: saved position and pinned public key of each connected slave |
 | `master_id`, `master_key`, `offset_x/_y`, `config_version` | | slave: the paired master and the last configuration |
@@ -231,6 +233,8 @@ sudo net-mouse-ctl monitors 2560x1440+0+0,1920x1080+2560+0     # or: auto
 net-mouse-ctl status                 # service state + what the daemon sees (JSON)
 net-mouse-ctl fingerprint            # this PC's key fingerprint (compare it when connecting)
 sudo net-mouse-ctl forget-master     # slave: release it so another master can connect it
+net-mouse-ctl interfaces             # network interfaces and which are in use
+sudo net-mouse-ctl interfaces eno1   # use only eno1 (or: all); applied immediately
 net-mouse-ctl logs                   # follow the journal
 net-mouse-ctl gui                    # settings window
 ```
@@ -244,7 +248,7 @@ Start it from the application menu (*Net Mouse*) or with `net-mouse-gui`. It tal
   click one to connect it (compare the fingerprint). Drag the green slave screens next to the master's
   monitors; edges snap together, and the pointer crosses where screens touch. Right-click to disconnect.
 * **This PC:** the monitor layout (*Detect* reads it from `xrandr`, *Auto* uses the DRM detection), the
-  role, and on a slave *Forget master*.
+  role, the network interfaces to use, and on a slave *Forget master*.
 
 Anyone can view the status. Changes need root or membership in `sudo`, `wheel`, `admin` or `netmouse`.
 

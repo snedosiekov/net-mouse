@@ -23,6 +23,7 @@ std::string toHex(uint64_t value) {
 }
 
 bool Config::load(const std::filesystem::path& path) {
+  std::lock_guard lock(mutex_);
   path_ = path;
   values_.clear();
   std::ifstream in(path);
@@ -40,6 +41,7 @@ bool Config::load(const std::filesystem::path& path) {
 }
 
 bool Config::save() const {
+  std::lock_guard lock(mutex_);
   std::error_code ec;
   if (path_.has_parent_path()) std::filesystem::create_directories(path_.parent_path(), ec);
   std::filesystem::path tmp = path_;
@@ -55,12 +57,34 @@ bool Config::save() const {
   return !ec;
 }
 
+std::filesystem::path Config::path() const {
+  std::lock_guard lock(mutex_);
+  return path_;
+}
+
+bool Config::has(const std::string& key) const {
+  std::lock_guard lock(mutex_);
+  return values_.count(key) != 0;
+}
+
+void Config::set(const std::string& key, const std::string& value) {
+  std::lock_guard lock(mutex_);
+  values_[key] = value;
+}
+
+void Config::erase(const std::string& key) {
+  std::lock_guard lock(mutex_);
+  values_.erase(key);
+}
+
 std::string Config::get(const std::string& key, const std::string& def) const {
+  std::lock_guard lock(mutex_);
   auto it = values_.find(key);
   return it == values_.end() ? def : it->second;
 }
 
 int64_t Config::getInt(const std::string& key, int64_t def) const {
+  std::lock_guard lock(mutex_);
   auto it = values_.find(key);
   if (it == values_.end()) return def;
   int64_t v = 0;
@@ -70,6 +94,7 @@ int64_t Config::getInt(const std::string& key, int64_t def) const {
 }
 
 uint64_t Config::getHex(const std::string& key, uint64_t def) const {
+  std::lock_guard lock(mutex_);
   auto it = values_.find(key);
   if (it == values_.end()) return def;
   uint64_t v = 0;
@@ -78,6 +103,6 @@ uint64_t Config::getHex(const std::string& key, uint64_t def) const {
   return res.ec == std::errc() ? v : def;
 }
 
-void Config::setHex(const std::string& key, uint64_t value) { values_[key] = toHex(value); }
+void Config::setHex(const std::string& key, uint64_t value) { set(key, toHex(value)); }
 
 }  // namespace nm

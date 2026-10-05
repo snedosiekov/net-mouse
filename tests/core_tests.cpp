@@ -14,6 +14,7 @@
 #include "core/keymap.h"
 #include "core/layout.h"
 #include "core/protocol.h"
+#include "core/udp.h"
 
 using namespace nm;
 
@@ -266,6 +267,18 @@ void testConfig() {
   CHECK(d.load(path));
   CHECK(d.get("role") == "master" && d.getHex("id") == 0xABCDEF0123456789ull && d.getInt("neg") == -42);
   fs::remove(path);
+}
+
+void testInterfaceList() {
+  CHECK((parseInterfaceList(" Ethernet 5 , eno1,,10.10.69.150 ") ==
+         std::vector<std::string>{"Ethernet 5", "eno1", "10.10.69.150"}));
+  CHECK(parseInterfaceList("").empty());
+  CHECK(joinInterfaceList({"Ethernet 5", "eno1"}) == "Ethernet 5, eno1");
+  NetInterface eth{0x0A0A4596, 0xFFFFFF00, "Ethernet 5"};
+  CHECK(interfaceMatches(eth, "ethernet 5"));  // names are case-insensitive
+  CHECK(interfaceMatches(eth, "10.10.69.150"));
+  CHECK(!interfaceMatches(eth, "Ethernet"));
+  CHECK(!interfaceMatches(eth, "10.10.69.151"));
 }
 
 void testKeymap() {
@@ -572,6 +585,7 @@ int main() {
   testLayout();
   testConfig();
   testKeymap();
+  testInterfaceList();
   testPairing();
   testSession();
   testKeyboardSession();

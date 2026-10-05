@@ -4,6 +4,7 @@
 #   net-mouse-ctl role [master|slave]    show or change the role (restarts the service)
 #   net-mouse-ctl monitors [SPEC|auto]   show or set this PC's monitor layout, e.g. 1920x1080+0+0,2560x1440+1920+0
 #   net-mouse-ctl status                 service state and what the daemon sees
+#   net-mouse-ctl interfaces [LIST|all]  show or set the network interfaces to use, e.g. eno1 (applied immediately)
 #   net-mouse-ctl fingerprint            this PC's key fingerprint (compare it when connecting)
 #   net-mouse-ctl forget-master          slave: drop the paired master so another one can connect it
 #   net-mouse-ctl logs                   follow the service log
@@ -102,6 +103,22 @@ case "$cmd" in
     fi
     ;;
 
+  interfaces)
+    if [ $# -eq 0 ]; then
+      reply=$("$DAEMON" --query status) || die "the service is not running"
+      echo "$reply" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+print("in use:", s["interface_filter"] or "all interfaces")
+for i in s["interfaces"]:
+    mark = "x" if i["selected"] else " "
+    print(" [%s] %-20s %s" % (mark, i["name"], i["ip"] or "not connected"))'
+      exit 0
+    fi
+    as_root interfaces "$@"
+    "$DAEMON" --query "set-interfaces $*"
+    ;;
+
   fingerprint)
     reply=$("$DAEMON" --query status) || die "the service is not running"
     # The first "fingerprint" in the status is this PC's own (the master's/slaves' come later).
@@ -154,6 +171,6 @@ case "$cmd" in
     ;;
 
   *)
-    die "unknown command '$cmd' (role, monitors, status, fingerprint, forget-master, logs, gui, setup, remove)"
+    die "unknown command '$cmd' (role, monitors, interfaces, status, fingerprint, forget-master, logs, gui, setup, remove)"
     ;;
 esac

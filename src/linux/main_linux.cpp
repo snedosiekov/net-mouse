@@ -147,12 +147,27 @@ struct DaemonState {
   std::string monitorSpec;
   MasterEngine* master = nullptr;
   SlaveEngine* slave = nullptr;
+  UdpMulticast* net = nullptr;
 };
 
+std::string interfacesJson(const UdpMulticast& net) {
+  std::string out = "[";
+  for (const UdpMulticast::Choice& c : net.choices()) {
+    if (out.size() > 1) out += ",";
+    out += log::fmt("{\"name\":\"%s\",\"ip\":\"%s\",\"up\":%s,\"selected\":%s}", jsonEscape(c.iface.name).c_str(),
+                    c.iface.addr ? ipToString(c.iface.addr).c_str() : "", c.iface.addr ? "true" : "false",
+                    c.selected ? "true" : "false");
+  }
+  return out + "]";
+}
+
 std::string statusJson(const DaemonState& st) {
-  std::string out = log::fmt("{\"role\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"config\":\"%s\",\"monitor_spec\":\"%s\",",
-                             st.role.c_str(), jsonEscape(st.name).c_str(), toHex(st.id).c_str(),
-                             jsonEscape(st.configPath).c_str(), jsonEscape(st.monitorSpec).c_str());
+  std::string out = log::fmt(
+      "{\"role\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"config\":\"%s\",\"monitor_spec\":\"%s\","
+      "\"interface_filter\":\"%s\",\"interfaces\":%s,",
+      st.role.c_str(), jsonEscape(st.name).c_str(), toHex(st.id).c_str(), jsonEscape(st.configPath).c_str(),
+      jsonEscape(st.monitorSpec).c_str(), jsonEscape(joinInterfaceList(st.net->filter())).c_str(),
+      interfacesJson(*st.net).c_str());
   if (st.master) {
     const MasterSnapshot s = st.master->snapshot();
     out += log::fmt("\"fingerprint\":\"%s\",\"remote\":%s,\"active\":\"%s\",\"pointer\":%s,\"monitors\":%s,\"slaves\":[",
@@ -231,6 +246,23 @@ std::string handleRequest(const DaemonState& st, const std::string& request, boo
     }
     return st.master->unpairSlave(slaveId) ? "ok" : "error that PC is not connected";
   }
+  if (cmd == "set-interfaces") {
+    // "all" or a comma-separated list of interface names/addresses; applied immediately.
+    std::string rest;
+    std::getline(in, rest);
+    std::vector<std::string> list = parseInterfaceList(rest);
+    if (list.size() == 1 && list[0] == "all") list.clear();
+    if (list.empty() && rest.find_first_not_of(" \t") == std::string::npos) {
+      return "error usage: set-interfaces all|NAME[,NAME...]";
+    }
+    Config fresh;
+    fresh.load(st.configPath);
+    fresh.set("interfaces", joinInterfaceList(list));
+    fresh.erase("interface");
+    if (!fresh.save()) return "error cannot write " + st.configPath;
+    st.net->setFilter(list);
+    return "ok";
+  }
   if (cmd == "forget-master") {
     if (!st.slave) return "error only a slave has a master to forget";
     st.slave->forgetMaster();
@@ -265,7 +297,7 @@ std::string handleRequest(const DaemonState& st, const std::string& request, boo
     return saveSetting(st.configPath, "monitors", spec);
   }
   return "error unknown request '" + cmd +
-         "' (status, pair, unpair, set-offset, forget-master, set-role, set-monitors)";
+         "' (status, pair, unpair, set-offset, forget-master, set-role, set-monitors, set-interfaces)";
 }
 
 }  // namespace
@@ -330,7 +362,11 @@ int main(int argc, char** argv) {
 
   UdpMulticast net;
   std::string error;
-  if (!net.open(group, static_cast<uint16_t>(port), config.get("interface"), error)) {
+  // Network interfaces to use: "interfaces" (names or addresses; empty = all), or the older
+  // single-address "interface" setting.
+  std::vector<std::string> interfaces = parseInterfaceList(config.get("interfaces"));
+  if (interfaces.empty() && !config.get("interface").empty()) interfaces.push_back(config.get("interface"));
+  if (!net.open(group, static_cast<uint16_t>(port), interfaces, error)) {
     log::info("Network setup failed: " + error);
     return 1;
   }
@@ -378,7 +414,7 @@ int main(int argc, char** argv) {
     slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{id, name, identity}, config, net, displays, *injector);
   }
 
-  DaemonState state{role, name, id, args.config, monitorSpec, master.get(), slave.get()};
+  DaemonState state{role, name, id, args.config, monitorSpec, master.get(), slave.get(), &net};
   ControlServer control;
   if (!control.start(
           args.control, [&state](const std::string& req, bool privileged) { return handleRequest(state, req, privileged); },

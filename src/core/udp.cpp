@@ -22,6 +22,7 @@ using SockLen = socklen_t;
 static void closeSocket(SocketHandle s) { ::close(s); }
 #endif
 
+#include <cctype>
 #include <cstring>
 
 namespace nm {
@@ -107,9 +108,41 @@ std::vector<NetInterface> listInterfaces() {
   return result;
 }
 
+std::vector<std::string> parseInterfaceList(const std::string& text) {
+  std::vector<std::string> list;
+  size_t start = 0;
+  while (start <= text.size()) {
+    size_t comma = text.find(',', start);
+    if (comma == std::string::npos) comma = text.size();
+    std::string item = text.substr(start, comma - start);
+    const size_t b = item.find_first_not_of(" \t");
+    const size_t e = item.find_last_not_of(" \t");
+    if (b != std::string::npos) list.push_back(item.substr(b, e - b + 1));
+    start = comma + 1;
+  }
+  return list;
+}
+
+std::string joinInterfaceList(const std::vector<std::string>& list) {
+  std::string out;
+  for (const std::string& item : list) out += (out.empty() ? "" : ", ") + item;
+  return out;
+}
+
+bool interfaceMatches(const NetInterface& ni, const std::string& entry) {
+  if (ni.addr != 0 && entry == ipToString(ni.addr)) return true;
+  if (entry.size() != ni.name.size()) return false;
+  for (size_t i = 0; i < entry.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(entry[i])) != std::tolower(static_cast<unsigned char>(ni.name[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 UdpMulticast::~UdpMulticast() { close(); }
 
-bool UdpMulticast::open(const std::string& group, uint16_t port, const std::string& iface,
+bool UdpMulticast::open(const std::string& group, uint16_t port, const std::vector<std::string>& filter,
                         std::string& error) {
 #ifdef _WIN32
   WSADATA wsa;
@@ -123,11 +156,11 @@ bool UdpMulticast::open(const std::string& group, uint16_t port, const std::stri
     error = "invalid multicast group: " + group;
     return false;
   }
-  if (!iface.empty() && !parseIp(iface, fixedIface_)) {
-    error = "invalid interface address: " + iface;
-    return false;
-  }
   port_ = port;
+  {
+    std::lock_guard lock(mutex_);
+    filter_ = filter;
+  }
 
   SocketHandle s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 #ifdef _WIN32
@@ -158,15 +191,25 @@ bool UdpMulticast::open(const std::string& group, uint16_t port, const std::stri
   setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, reinterpret_cast<const char*>(&ttl), sizeof(ttl));
   int loop = 1;  // lets a master and a slave on the same PC see each other
   setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, reinterpret_cast<const char*>(&loop), sizeof(loop));
+#ifdef __linux__
+#ifndef IP_MULTICAST_ALL
+#define IP_MULTICAST_ALL 49
+#endif
+  // Linux would otherwise deliver the group from every interface any socket joined it on.
+  int all = 0;
+  setsockopt(s, IPPROTO_IP, IP_MULTICAST_ALL, &all, sizeof(all));
+#endif
 
   refreshInterfaces();
-  {
-    std::lock_guard lock(mutex_);
-    if (joined_.empty()) {
+  std::lock_guard lock(mutex_);
+  if (joined_.empty()) {
+    if (filter_.empty()) {
       error = "could not join multicast group " + group;
       close();
       return false;
     }
+    log::info("None of the selected network interfaces (" + joinInterfaceList(filter_) +
+              ") is up yet; waiting for them");
   }
   return true;
 }
@@ -184,41 +227,85 @@ void UdpMulticast::close() {
 #endif
 }
 
+void UdpMulticast::setFilter(const std::vector<std::string>& filter) {
+  {
+    std::lock_guard lock(mutex_);
+    filter_ = filter;
+  }
+  log::info(filter.empty() ? std::string("Network: using every interface")
+                           : "Network: using only " + joinInterfaceList(filter));
+  refreshInterfaces();
+}
+
+std::vector<std::string> UdpMulticast::filter() const {
+  std::lock_guard lock(mutex_);
+  return filter_;
+}
+
+std::vector<UdpMulticast::Choice> UdpMulticast::choices() const {
+  std::lock_guard lock(mutex_);
+  std::vector<Choice> out;
+  for (const NetInterface& ni : all_) {
+    bool selected = filter_.empty();
+    for (const std::string& entry : filter_) selected = selected || interfaceMatches(ni, entry);
+    out.push_back({ni, selected});
+  }
+  for (const std::string& entry : filter_) {  // selected but not up right now (e.g. a VPN that is off)
+    bool present = false;
+    for (const NetInterface& ni : all_) present = present || interfaceMatches(ni, entry);
+    if (!present) out.push_back({NetInterface{0, 0, entry}, true});
+  }
+  return out;
+}
+
+bool UdpMulticast::membershipLocked(uint32_t ifaceAddr, bool join) {
+  ip_mreq mreq{};
+  mreq.imr_multiaddr = toInAddr(group_);
+  mreq.imr_interface = toInAddr(ifaceAddr);
+  return setsockopt(handle(sock_), IPPROTO_IP, join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP,
+                    reinterpret_cast<const char*>(&mreq), sizeof(mreq)) == 0;
+}
+
 void UdpMulticast::refreshInterfaces() {
   if (sock_ == -1) return;
   std::vector<NetInterface> found = listInterfaces();
-  const uint32_t primary = defaultRouteAddress();
+  const uint32_t defaultRoute = defaultRouteAddress();
   std::lock_guard lock(mutex_);
-  interfaces_ = found;
-  // Prefer the default-route address; without one (isolated LAN) use the first interface.
-  primary_ = primary ? primary : (found.empty() ? 0 : found.front().addr);
-  std::vector<uint32_t> wanted;
-  if (fixedIface_) {
-    wanted.push_back(fixedIface_);
-  } else {
-    for (const NetInterface& ni : found) wanted.push_back(ni.addr);
+  all_ = found;
+  interfaces_.clear();
+  for (const NetInterface& ni : found) {
+    bool use = filter_.empty();
+    for (const std::string& entry : filter_) use = use || interfaceMatches(ni, entry);
+    if (use) interfaces_.push_back(ni);
+  }
+  // Main address: the default-route one if it is in use, else the first interface in use.
+  primary_ = interfaces_.empty() ? 0 : interfaces_.front().addr;
+  for (const NetInterface& ni : interfaces_) {
+    if (ni.addr == defaultRoute) primary_ = defaultRoute;
+  }
+
+  std::set<uint32_t> wanted;
+  for (const NetInterface& ni : interfaces_) wanted.insert(ni.addr);
+  for (auto it = joined_.begin(); it != joined_.end();) {  // leave interfaces no longer in use
+    if (!wanted.count(*it) && !(*it == 0 && filter_.empty() && interfaces_.empty())) {
+      membershipLocked(*it, false);
+      log::info("Left multicast group " + ipToString(group_) + " on " + (*it ? ipToString(*it) : "the default interface"));
+      it = joined_.erase(it);
+    } else {
+      ++it;
+    }
   }
   for (uint32_t addr : wanted) {
     if (joined_.count(addr)) continue;
-    ip_mreq mreq{};
-    mreq.imr_multiaddr = toInAddr(group_);
-    mreq.imr_interface = toInAddr(addr);
-    if (setsockopt(handle(sock_), IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq),
-                   sizeof(mreq)) == 0) {
+    if (membershipLocked(addr, true)) {
       joined_.insert(addr);
       log::info("Joined multicast group " + ipToString(group_) + " on " + ipToString(addr));
     }
   }
-  if (joined_.empty()) {
+  if (joined_.empty() && filter_.empty() && membershipLocked(0, true)) {
     // No usable interface yet: let the OS choose one.
-    ip_mreq mreq{};
-    mreq.imr_multiaddr = toInAddr(group_);
-    mreq.imr_interface = toInAddr(INADDR_ANY);
-    if (setsockopt(handle(sock_), IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq),
-                   sizeof(mreq)) == 0) {
-      joined_.insert(0);
-      log::info("Joined multicast group " + ipToString(group_) + " on the default interface");
-    }
+    joined_.insert(0);
+    log::info("Joined multicast group " + ipToString(group_) + " on the default interface");
   }
 }
 
@@ -240,6 +327,8 @@ int UdpMulticast::receive(uint8_t* buffer, size_t capacity, uint32_t& sourceIp, 
                                           reinterpret_cast<sockaddr*>(&from), &fromLen));
   if (n <= 0) return 0;  // e.g. WSAECONNRESET after an ICMP "port unreachable"
   sourceIp = ntohl(from.sin_addr.s_addr);
+  std::lock_guard lock(mutex_);
+  if (!filter_.empty() && !isLocalSubnetLocked(sourceIp)) return 0;  // from a network that is not selected
   return n;
 }
 
@@ -257,6 +346,20 @@ void UdpMulticast::sendToGroupLocked(const std::vector<uint8_t>& datagram) {
   to.sin_addr = toInAddr(group_);
   sendto(handle(sock_), reinterpret_cast<const char*>(datagram.data()), static_cast<int>(datagram.size()), 0,
          reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+void UdpMulticast::sendOnAllActiveLocked(const std::vector<uint8_t>& datagram) {
+  if (interfaces_.empty()) {
+    if (filter_.empty()) {  // nothing detected: let the OS pick; with a selection, send nowhere else
+      setOutgoingLocked(0);
+      sendToGroupLocked(datagram);
+    }
+    return;
+  }
+  for (const NetInterface& ni : interfaces_) {
+    setOutgoingLocked(ni.addr);
+    sendToGroupLocked(datagram);
+  }
 }
 
 uint32_t defaultRouteAddress() {
@@ -301,41 +404,18 @@ bool UdpMulticast::isLocalSubnet(uint32_t ip) const {
 void UdpMulticast::send(const std::vector<uint8_t>& datagram, uint32_t peerIp) {
   if (sock_ == -1) return;
   std::lock_guard lock(mutex_);
-  if (fixedIface_) {
-    setOutgoingLocked(fixedIface_);
-    sendToGroupLocked(datagram);
-    return;
-  }
-  if (peerIp != kRouteDefault && peerIp != kRouteAllInterfaces && !isLocalSubnetLocked(peerIp)) {
-    peerIp = kRouteAllInterfaces;  // not on any of our subnets: the right interface is unknown
-  }
-  if (peerIp == kRouteAllInterfaces) {
-    if (interfaces_.empty()) {
-      setOutgoingLocked(0);
-      sendToGroupLocked(datagram);
-    }
-    for (const NetInterface& ni : interfaces_) {
-      setOutgoingLocked(ni.addr);
-      sendToGroupLocked(datagram);
-    }
+  if (peerIp == kRouteDefault || peerIp == kRouteAllInterfaces || !isLocalSubnetLocked(peerIp)) {
+    sendOnAllActiveLocked(datagram);  // the right interface is unknown
     return;
   }
   // Several local interfaces can share the peer's subnet (e.g. Ethernet plus a bridged VPN adapter)
   // and only one of them may actually reach it, so send through every match; the receiver drops
   // duplicates by sequence number.
-  bool sent = false;
-  if (peerIp != kRouteDefault) {
-    for (const NetInterface& ni : interfaces_) {
-      if (ni.mask && (ni.addr & ni.mask) == (peerIp & ni.mask)) {
-        setOutgoingLocked(ni.addr);
-        sendToGroupLocked(datagram);
-        sent = true;
-      }
+  for (const NetInterface& ni : interfaces_) {
+    if (ni.mask && (ni.addr & ni.mask) == (peerIp & ni.mask)) {
+      setOutgoingLocked(ni.addr);
+      sendToGroupLocked(datagram);
     }
-  }
-  if (!sent) {
-    setOutgoingLocked(0);
-    sendToGroupLocked(datagram);
   }
 }
 
