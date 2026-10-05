@@ -386,6 +386,22 @@ void testSession() {
   CHECK(master.onMouseMove({0, 100}));  // left edge now leads to the slave
 }
 
+// A monitor added to the master where a slave was placed: the slave moves out of the way.
+void testOverlapAfterMonitorChange() {
+  Rig r("overlap", {0, 0, 1920, 1080});
+  r.connect();
+  CHECK(r.master->snapshot().slaves[0].offset == Point(1920, 0));
+  r.masterDisplays.list.push_back({{1920, 0, 3840, 1200}, false, "M2"});  // right where the slave was
+  r.now += 1500;
+  r.master->tick(r.now);  // notices the new monitor
+  const auto view = r.master->snapshot().slaves[0];
+  CHECK(view.offset == Point(3840, 0) && !view.synced);
+  deliver(r.masterNet, *r.slave, r.now);  // the new position reaches the slave
+  CHECK(r.slave->snapshot().offset == Point(3840, 0));
+  CHECK(!r.master->onMouseMove({1919, 500}));  // that edge now leads to the master's own monitor
+  CHECK(r.master->onMouseMove({3839, 500}));   // and the new one to the slave
+}
+
 void testKeyboardSession() {
   Rig r("keyboard", {0, 0, 1920, 1080});
   r.connect();
@@ -559,6 +575,7 @@ int main() {
   testPairing();
   testSession();
   testKeyboardSession();
+  testOverlapAfterMonitorChange();
   testSecurity();
   testMultiHomedSlave();
   if (g_failures == 0) std::printf("All tests passed\n");

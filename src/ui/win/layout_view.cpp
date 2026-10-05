@@ -272,7 +272,7 @@ void LayoutView::paint(HDC dc, const RECT& area, const MasterSnapshot& snapshot,
     g.FillEllipse(&core, p.x - rad, p.y - rad, 2 * rad, 2 * rad);
   }
 
-  if (snap_.slaves.empty()) {
+  if (std::none_of(snap_.slaves.begin(), snap_.slaves.end(), [](const SlaveView& v) { return v.online; })) {
     gp::StringFormat format;
     format.SetAlignment(gp::StringAlignmentCenter);
     gp::SolidBrush hintBrush(gp::Color(255, 90, 98, 110));

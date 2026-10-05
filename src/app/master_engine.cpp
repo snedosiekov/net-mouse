@@ -343,6 +343,7 @@ void MasterEngine::handleHelloLocked(const proto::SlaveHello& hello, uint64_t se
     }
   }
   if (topologyChanged) {
+    resolveOverlapsLocked();  // it came back, was placed, or its monitors changed
     rebuildScreensLocked();
     ++changes_;
   }
@@ -531,9 +532,47 @@ void MasterEngine::refreshMonitorsLocked() {
   std::vector<MonitorInfo> current = displays_.monitors();
   if (current == monitors_) return;
   monitors_ = std::move(current);
+  resolveOverlapsLocked();
   rebuildScreensLocked();
   if (!remote_) park_ = parkPointLocked();
   ++changes_;
+}
+
+// A slave whose saved position overlaps another screen (e.g. a monitor was added to the master, or
+// the slave's own monitors changed) would be partly unreachable: move it to the right of
+// everything, like a newly connected slave.
+void MasterEngine::resolveOverlapsLocked() {
+  std::vector<Rect> occupied;
+  Rect primary;
+  for (const MonitorInfo& m : monitors_) {
+    occupied.push_back(m.rect);
+    if (m.primary) primary = m.rect;
+  }
+  if (primary.empty() && !monitors_.empty()) primary = monitors_.front().rect;
+  bool moved = false;
+  for (Slave& s : slaves_) {
+    if (!s.placed || !s.online || !s.paired || s.keyMismatch || s.monitors.empty()) continue;
+    auto rectsAt = [&s](Point offset) {
+      std::vector<Rect> rects;
+      for (const Rect& r : s.monitors) rects.push_back(r.translated(offset));
+      return rects;
+    };
+    if (layout::overlapsAny(rectsAt(s.offset), occupied)) {
+      s.offset = layout::autoPlace(occupied, primary, boundingRect(s.monitors));
+      s.version = allocVersionLocked();
+      s.synced = false;
+      s.configDue = true;
+      saveSlaveLocked(s);
+      log::info(log::fmt("Slave '%s' overlapped another screen; moved to (%d, %d)", s.name.c_str(), s.offset.x,
+                         s.offset.y));
+      moved = true;
+    }
+    for (const Rect& r : rectsAt(s.offset)) occupied.push_back(r);
+  }
+  if (moved) {
+    rebuildScreensLocked();
+    ++changes_;
+  }
 }
 
 void MasterEngine::rebuildScreensLocked() {

@@ -274,12 +274,11 @@ class App:
                 lines.append(f"Pointer and keyboard are on \"{active}\"  (Ctrl+Alt+Home brings them back)")
             else:
                 lines.append("Pointer is on this PC")
-            if not slaves:
-                lines.append("No other PCs found yet. Install Net Mouse on another PC as slave.")
-            for v in slaves:
-                if not v["online"]:
-                    state = "connected, offline" if v["paired"] else "offline"
-                elif v["key_mismatch"]:
+            online = [v for v in slaves if v["online"]]  # offline PCs are remembered but not shown
+            if not online:
+                lines.append("No other PCs on the network right now. Install Net Mouse on another PC as slave.")
+            for v in online:
+                if v["key_mismatch"]:
                     state = "KEY CHANGED \u2014 not trusted"
                 elif not v["paired"]:
                     state = "paired with another master" if v["other_master"] else "available"
@@ -400,7 +399,7 @@ class App:
             px, py = self.to_canvas(s["pointer"]["x"], s["pointer"]["y"])
             c.create_oval(px - 8, py - 8, px + 8, py + 8, fill="white", outline="")
             c.create_oval(px - 6, py - 6, px + 6, py + 6, fill=ACTIVE, outline="")
-        if s.get("role") == "master" and not s.get("slaves"):
+        if s.get("role") == "master" and not any(v["online"] for v in s.get("slaves", [])):
             c.create_text(c.winfo_width() / 2, c.winfo_height() - 20, fill="#5a5a5a",
                           text="Waiting for slaves… Install Net Mouse on another PC and choose \"slave\".")
 

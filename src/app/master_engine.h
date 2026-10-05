@@ -104,6 +104,7 @@ class MasterEngine : public IInputSink {
   uint32_t allocVersionLocked();
   void saveSlaveLocked(const Slave& s);
   void ensurePlacedLocked(Slave& s);
+  void resolveOverlapsLocked();
   void sendConfigLocked(Slave& s, uint64_t nowMs);
   void startSessionLocked(Slave& s, uint64_t nowMs);
   void handleHelloLocked(const proto::SlaveHello& hello, uint64_t sender, uint32_t ip, uint64_t nowMs);

@@ -15,6 +15,7 @@
 #include <shellapi.h>
 #include <windowsx.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -224,12 +225,13 @@ std::wstring statusText() {
     } else {
       t += L"Pointer is on this PC\n";
     }
-    if (s.slaves.empty()) t += L"No other PCs found yet.\n";
+    // Only PCs that are on the network right now; offline ones are remembered but not shown.
+    const bool anyOnline = std::any_of(s.slaves.begin(), s.slaves.end(), [](const SlaveView& v) { return v.online; });
+    if (!anyOnline) t += L"No other PCs on the network right now.\n";
     for (const SlaveView& v : s.slaves) {
+      if (!v.online) continue;
       std::wstring state;
-      if (!v.online) {
-        state = v.paired ? L"connected, offline" : L"offline";
-      } else if (v.keyMismatch) {
+      if (v.keyMismatch) {
         state = L"KEY CHANGED — not trusted";
       } else if (!v.paired) {
         state = v.otherMaster ? L"paired with another master" : L"available";
