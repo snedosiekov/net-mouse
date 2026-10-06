@@ -57,8 +57,8 @@ class UdpMulticast : public ITransport {
   // and leaves it on interfaces that are no longer selected.
   void refreshInterfaces();
 
-  // Waits up to timeoutMs. Returns the datagram size, 0 on timeout/transient error or a datagram
-  // from outside the selected networks, -1 if closed.
+  // Waits up to timeoutMs. Returns the datagram size, 0 on timeout/transient error, -1 if closed.
+  // Only datagrams arriving on the selected interfaces are delivered (group membership).
   int receive(uint8_t* buffer, size_t capacity, uint32_t& sourceIp, int timeoutMs);
 
   void send(const std::vector<uint8_t>& datagram, uint32_t peerIp) override;

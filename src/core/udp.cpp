@@ -327,8 +327,10 @@ int UdpMulticast::receive(uint8_t* buffer, size_t capacity, uint32_t& sourceIp, 
                                           reinterpret_cast<sockaddr*>(&from), &fromLen));
   if (n <= 0) return 0;  // e.g. WSAECONNRESET after an ICMP "port unreachable"
   sourceIp = ntohl(from.sin_addr.s_addr);
-  std::lock_guard lock(mutex_);
-  if (!filter_.empty() && !isLocalSubnetLocked(sourceIp)) return 0;  // from a network that is not selected
+  // No check of the sender's address against the selected subnets: a network card with several
+  // addresses sends from its first one, whatever interface address was chosen. Interfaces that are not
+  // selected are kept out by the group membership (joined only on selected interfaces; on Linux
+  // with IP_MULTICAST_ALL off).
   return n;
 }
 
