@@ -23,12 +23,21 @@ static void closeSocket(SocketHandle s) { ::close(s); }
 #endif
 
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 
 namespace nm {
 namespace {
 
 SocketHandle handle(intptr_t s) { return static_cast<SocketHandle>(s); }
+
+int lastSocketError() {
+#ifdef _WIN32
+  return WSAGetLastError();
+#else
+  return errno;
+#endif
+}
 
 in_addr toInAddr(uint32_t hostOrder) {
   in_addr a{};
@@ -266,6 +275,44 @@ bool UdpMulticast::membershipLocked(uint32_t ifaceAddr, bool join) {
                     reinterpret_cast<const char*>(&mreq), sizeof(mreq)) == 0;
 }
 
+bool UdpMulticast::joinLocked(uint32_t addr) {
+  bool ok = membershipLocked(addr, true);
+  if (!ok) {
+    // After sleep or a network change the OS may have restored the membership by itself (and then
+    // refuses a second join) without telling the network: drop it and join again, which also sends
+    // a fresh IGMP report so switches and Wi-Fi access points forward the group again.
+    const int err = lastSocketError();
+    membershipLocked(addr, false);
+    ok = membershipLocked(addr, true);
+    if (!ok && joinFailLogged_.insert(addr).second) {
+      log::info("Could not join multicast group " + ipToString(group_) + " on " + ipToString(addr) +
+                " (error " + std::to_string(err) + "); retrying");
+    }
+  }
+  if (ok) {
+    joined_.insert(addr);
+    joinFailLogged_.erase(addr);
+    log::info("Joined multicast group " + ipToString(group_) + " on " + ipToString(addr));
+  }
+  return ok;
+}
+
+void UdpMulticast::renewMemberships() {
+  if (sock_ == -1) return;
+  std::lock_guard lock(mutex_);
+  for (auto it = joined_.begin(); it != joined_.end();) {
+    membershipLocked(*it, false);
+    if (membershipLocked(*it, true)) {
+      ++it;
+    } else {  // the next refreshInterfaces() tries again
+      log::info("Could not renew multicast group " + ipToString(group_) + " on " +
+                (*it ? ipToString(*it) : "the default interface") + " (error " +
+                std::to_string(lastSocketError()) + ")");
+      it = joined_.erase(it);
+    }
+  }
+}
+
 void UdpMulticast::refreshInterfaces() {
   if (sock_ == -1) return;
   std::vector<NetInterface> found = listInterfaces();
@@ -296,11 +343,7 @@ void UdpMulticast::refreshInterfaces() {
     }
   }
   for (uint32_t addr : wanted) {
-    if (joined_.count(addr)) continue;
-    if (membershipLocked(addr, true)) {
-      joined_.insert(addr);
-      log::info("Joined multicast group " + ipToString(group_) + " on " + ipToString(addr));
-    }
+    if (!joined_.count(addr)) joinLocked(addr);
   }
   if (joined_.empty() && filter_.empty() && membershipLocked(0, true)) {
     // No usable interface yet: let the OS choose one.
@@ -406,18 +449,41 @@ bool UdpMulticast::isLocalSubnet(uint32_t ip) const {
 void UdpMulticast::send(const std::vector<uint8_t>& datagram, uint32_t peerIp) {
   if (sock_ == -1) return;
   std::lock_guard lock(mutex_);
-  if (peerIp == kRouteDefault || peerIp == kRouteAllInterfaces || !isLocalSubnetLocked(peerIp)) {
-    sendOnAllActiveLocked(datagram);  // the right interface is unknown
+  if (peerIp == kRouteDefault || peerIp == kRouteAllInterfaces) {
+    sendOnAllActiveLocked(datagram);
+    return;
+  }
+  bool ownAddress = (peerIp >> 24) == 127;
+  for (const NetInterface& ni : all_) ownAddress = ownAddress || ni.addr == peerIp;
+  std::vector<uint32_t> matches;
+  for (const NetInterface& ni : interfaces_) {
+    if (ni.mask && (ni.addr & ni.mask) == (peerIp & ni.mask)) matches.push_back(ni.addr);
+  }
+  // A peer on this PC (master and slave sharing the port) only gets the copy through the group:
+  // a unicast datagram would reach just one of the sockets.
+  if (!ownAddress) {
+    // Unicast is what reaches a peer reliably: Wi-Fi access points and IGMP-snooping switches may
+    // stop forwarding the group to a PC (e.g. after it slept), and over Wi-Fi unicast is acknowledged
+    // and retried while multicast is not.
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port_);
+    to.sin_addr = toInAddr(peerIp);
+    sendto(handle(sock_), reinterpret_cast<const char*>(datagram.data()), static_cast<int>(datagram.size()), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+    if (matches.size() <= 1) return;
+  }
+  if (matches.empty()) {
+    sendOnAllActiveLocked(datagram);
     return;
   }
   // Several local interfaces can share the peer's subnet (e.g. Ethernet plus a bridged VPN adapter)
-  // and only one of them may actually reach it, so send through every match; the receiver drops
-  // duplicates by sequence number.
-  for (const NetInterface& ni : interfaces_) {
-    if (ni.mask && (ni.addr & ni.mask) == (peerIp & ni.mask)) {
-      setOutgoingLocked(ni.addr);
-      sendToGroupLocked(datagram);
-    }
+  // and only one of them may actually reach it (the unicast copy takes whichever the routing table
+  // prefers), so also send to the group through every match; the receiver drops duplicates by
+  // sequence number.
+  for (uint32_t addr : matches) {
+    setOutgoingLocked(addr);
+    sendToGroupLocked(datagram);
   }
 }
 

@@ -421,7 +421,13 @@ void MasterEngine::tick(uint64_t nowMs) {
     p.sender = options_.id;
     p.seq = ++seq_;
     p.body = proto::MasterAnnounce{options_.name, options_.identity.publicKey};
-    transport_.send(proto::encode(p), kRouteAllInterfaces);
+    const auto bytes = proto::encode(p);
+    transport_.send(bytes, kRouteAllInterfaces);
+    // Also straight to every PC we hear: a switch or Wi-Fi access point may stop forwarding the group
+    // to one (typically after it slept) while its own announcements still reach us.
+    for (const Slave& s : slaves_) {
+      if (s.online && s.ip != 0) transport_.send(bytes, s.ip);
+    }
   }
 
   for (Slave& s : slaves_) {

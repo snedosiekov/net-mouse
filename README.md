@@ -150,7 +150,7 @@ next to it; it never leaves the PC. Logs: `netmouse-agent.log` and `netmouse-ser
 ```
  MASTER                                                      SLAVE
  WH_MOUSE_LL /          MasterEngine      encrypted UDP      SlaveEngine          SendInput
- WH_KEYBOARD_LL ──────► (layout space, ──── multicast ─────► (layout -> local, ──► (mouse, keys)
+ WH_KEYBOARD_LL ──────► (layout space, ───── to slave ─────► (layout -> local, ──► (mouse, keys)
  (swallow input          edge crossing,                       button/key
   while remote)          key routing)                         reconciliation)
 ```
@@ -176,7 +176,12 @@ the input desktop, also reach the lock and logon screens and UAC prompts.
 
 ### Protocol
 
-UDP multicast `239.255.77.77:47800`, TTL 1, protocol version 2. Every datagram starts with a readable
+UDP port `47800`, protocol version 2. Discovery (master announcements, slave hellos) goes to the
+multicast group `239.255.77.77` with TTL 1; it is also sent straight (unicast) to the PCs already heard,
+and everything for one slave goes to it by unicast only. Wi-Fi access points and IGMP-snooping switches
+sometimes stop forwarding a group to a PC, typically after it slept, and over Wi-Fi unicast is also
+acknowledged and retried. A slave that hears no master renews its group membership every 30 s.
+Every datagram starts with a readable
 header: magic `NMSE`, version, type, 64-bit sender id and a sequence number (little-endian). See
 [src/core/protocol.h](src/core/protocol.h).
 

@@ -16,6 +16,7 @@ void runNetworkLoop(UdpMulticast& net, MasterEngine* master, SlaveEngine* slave,
   std::vector<uint8_t> buffer(2048);
   uint64_t lastTick = 0;
   uint64_t lastInterfaceRefresh = steadyNowMs();
+  int silentRefreshes = 0;
   while (running) {
     uint32_t source = 0;
     const int n = net.receive(buffer.data(), buffer.size(), source, 20);
@@ -36,6 +37,16 @@ void runNetworkLoop(UdpMulticast& net, MasterEngine* master, SlaveEngine* slave,
     if (now - lastInterfaceRefresh >= 10'000) {
       lastInterfaceRefresh = now;
       net.refreshInterfaces();
+      // A slave that hears no master may have been forgotten by a switch or Wi-Fi access point
+      // (e.g. after sleep): announce its group membership again, every 30 s while it lasts.
+      if (slave && !slave->snapshot().masterOnline) {
+        if (++silentRefreshes >= 3) {
+          silentRefreshes = 0;
+          net.renewMemberships();
+        }
+      } else {
+        silentRefreshes = 0;
+      }
     }
   }
 }

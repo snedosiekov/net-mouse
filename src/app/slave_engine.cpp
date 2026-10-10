@@ -137,6 +137,11 @@ void SlaveEngine::handleSealedLocked(const proto::Packet& sealed, uint64_t nowMs
   const auto inner = proto::open(sealed, sessionKey_);
   if (!inner) return;  // not from our master, altered, or from an old session
   lastMasterSeenMs_ = nowMs;
+  if (!masterSeen_) {  // its announcements may not reach us, but the session traffic does
+    masterSeen_ = true;
+    log::info("Master is back (encrypted session)");
+    ++changes_;
+  }
   if (!acceptSeqLocked(inner->seq)) return;  // duplicate or replayed within this session
   if (const auto* cfg = std::get_if<proto::SlaveConfig>(&inner->body)) {
     handleConfigLocked(*cfg);
@@ -268,7 +273,10 @@ void SlaveEngine::sendHelloLocked() {
   proto::Packet p;
   p.sender = options_.id;
   p.body = std::move(hello);
-  transport_.send(proto::encode(p), kRouteAllInterfaces);
+  const auto bytes = proto::encode(p);
+  transport_.send(bytes, kRouteAllInterfaces);  // for discovery by any master
+  // Also straight to our master, in case the network does not deliver the group to it.
+  if (hasTrusted_ && masterIp_ != 0) transport_.send(bytes, masterIp_);
 }
 
 void SlaveEngine::tick(uint64_t nowMs) {

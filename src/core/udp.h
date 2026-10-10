@@ -56,6 +56,9 @@ class UdpMulticast : public ITransport {
   // Joins the group on interfaces that appeared since the last call (DHCP, VPN, cable plugged in)
   // and leaves it on interfaces that are no longer selected.
   void refreshInterfaces();
+  // Leaves and re-joins the group everywhere, so the OS announces the membership again (IGMP).
+  // For when nothing arrives although the interfaces look fine, e.g. after sleep on Wi-Fi.
+  void renewMemberships();
 
   // Waits up to timeoutMs. Returns the datagram size, 0 on timeout/transient error, -1 if closed.
   // Only datagrams arriving on the selected interfaces are delivered (group membership).
@@ -71,6 +74,7 @@ class UdpMulticast : public ITransport {
   void sendToGroupLocked(const std::vector<uint8_t>& datagram);
   void sendOnAllActiveLocked(const std::vector<uint8_t>& datagram);
   bool membershipLocked(uint32_t ifaceAddr, bool join);
+  bool joinLocked(uint32_t ifaceAddr);
 
   intptr_t sock_ = -1;
   uint32_t group_ = 0;
@@ -82,6 +86,7 @@ class UdpMulticast : public ITransport {
   std::vector<NetInterface> all_;         // every interface that is up
   std::vector<NetInterface> interfaces_;  // the ones in use (all_ when there is no filter)
   std::set<uint32_t> joined_;
+  std::set<uint32_t> joinFailLogged_;
   uint32_t currentOutgoing_ = 0xFFFFFFFFu;
   uint32_t primary_ = 0;
 };

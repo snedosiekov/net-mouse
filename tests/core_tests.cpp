@@ -35,7 +35,11 @@ namespace fs = std::filesystem;
 
 struct FakeTransport : ITransport {
   std::vector<std::vector<uint8_t>> sent;
-  void send(const std::vector<uint8_t>& d, uint32_t) override { sent.push_back(d); }
+  std::vector<uint32_t> peers;  // the peerIp of each sent datagram
+  void send(const std::vector<uint8_t>& d, uint32_t peer) override {
+    sent.push_back(d);
+    peers.push_back(peer);
+  }
 };
 
 struct FakeDisplays : IDisplays {
@@ -71,11 +75,30 @@ template <typename Engine>
 void deliver(FakeTransport& from, Engine& to, uint64_t now) {
   auto packets = std::move(from.sent);
   from.sent.clear();
+  from.peers.clear();
   for (const auto& bytes : packets) {
     auto p = proto::decode(bytes.data(), bytes.size());
     CHECK(p.has_value());
     if (p) to.onPacket(*p, 0x0A000002, now);
   }
+}
+
+// Like deliver(), but only what was addressed to `peer` (a network that lost the group); returns the count.
+template <typename Engine>
+int deliverAddressed(FakeTransport& from, Engine& to, uint32_t peer, uint64_t now) {
+  auto packets = std::move(from.sent);
+  auto peers = std::move(from.peers);
+  from.sent.clear();
+  from.peers.clear();
+  int count = 0;
+  for (size_t i = 0; i < packets.size(); ++i) {
+    if (peers[i] != peer) continue;
+    auto p = proto::decode(packets[i].data(), packets[i].size());
+    CHECK(p.has_value());
+    if (p) to.onPacket(*p, 0x0A000002, now);
+    ++count;
+  }
+  return count;
 }
 
 fs::path tempFile(const std::string& name) { return fs::temp_directory_path() / name; }
@@ -458,6 +481,31 @@ void testSession() {
   CHECK(master.onMouseMove({0, 100}));  // left edge now leads to the slave
 }
 
+// A slave whose network stopped delivering the multicast group (e.g. Wi-Fi after sleep) still
+// finds its master and gets input: announcements and session traffic are also addressed to it.
+void testGroupLostAfterSleep() {
+  Rig r("grouplost");
+  r.connect();
+  const uint32_t slaveIp = 0x0A000002;
+  r.now += 60'000;  // asleep
+  r.slave->tick(r.now);
+  CHECK(!r.slave->snapshot().masterOnline);
+
+  deliver(r.slaveNet, *r.master, r.now);  // its hellos still reach the master
+  r.master->tick(r.now + 2000);
+  CHECK(deliverAddressed(r.masterNet, *r.slave, slaveIp, r.now) > 0);  // the announcement
+  CHECK(r.slave->snapshot().masterOnline);
+
+  r.now += 60'000;
+  r.slave->tick(r.now);
+  CHECK(!r.slave->snapshot().masterOnline);
+  deliver(r.slaveNet, *r.master, r.now);
+  CHECK(r.master->onMouseMove({1919, 500}));
+  CHECK(deliverAddressed(r.masterNet, *r.slave, slaveIp, r.now) > 0);  // session traffic alone
+  CHECK(r.slave->snapshot().masterOnline && r.slave->snapshot().active);
+  CHECK(!r.injector.moves.empty() && r.injector.moves.back() == Point(0, 500));
+}
+
 // A monitor added to the master where a slave was placed: the slave moves out of the way.
 void testOverlapAfterMonitorChange() {
   Rig r("overlap", {0, 0, 1920, 1080});
@@ -649,6 +697,7 @@ int main() {
   testControlHandler();
   testPairing();
   testSession();
+  testGroupLostAfterSleep();
   testKeyboardSession();
   testOverlapAfterMonitorChange();
   testSecurity();
