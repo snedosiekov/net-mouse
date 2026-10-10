@@ -1,12 +1,18 @@
 # net-mouse
 
-Use the mouse of one PC (the **master**) to control that PC and any number of other PCs (**slaves**) on
-the same local network. Slave screens are arranged around the master's monitors, the same way as in the
-Windows display settings. When the pointer leaves the master's monitors through an edge that touches a
-slave screen, it continues on that slave.
+Use the mouse and keyboard of one PC (the **master**) to control that PC and any number of other PCs
+(**slaves**) on the same local network. Slave screens are arranged around the master's monitors, the same
+way as in the Windows display settings. When the pointer leaves the master's monitors through an edge that
+touches a slave screen, it continues on that slave, and the keyboard follows it.
 
-Windows 10/11 is fully supported, with a tray app, an arrangement editor and an installer. Linux is a
-**prototype**: a systemd service for both roles, working below the display server (see [Linux](#linux-prototype)).
+* **Zero setup on the slaves:** they find the master by UDP multicast; the master places them and sends
+  each its position.
+* **Pairing on the master** with key fingerprints; all control traffic is **encrypted and authenticated**
+  (X25519 + XChaCha20-Poly1305, see [Security](#security)).
+* **Windows 10/11:** a Windows service (works at the lock and logon screens and in UAC prompts), a tray
+  app with the arrangement editor, and an installer.
+* **Linux (prototype):** one systemd service for both roles, working below the display server, so the
+  same on X11 and Wayland (see [Linux](#linux-prototype)).
 
 ## Build
 
@@ -18,7 +24,8 @@ cmake --build build --config Release
 build\Release\nm_tests.exe
 ```
 
-The result is a single `build\Release\net-mouse.exe` (static runtime). Copy it to every PC.
+The result is a single `build\Release\net-mouse.exe` (static runtime) containing the service, the agent
+and the control app. Install it with the installer below; the service is what runs Net Mouse.
 
 ### Installer
 
@@ -104,11 +111,10 @@ Startup is enabled by default; add `/MERGETASKS="!autostart"` for a manually sta
 back to the master at once. A slave that disappears from the network also returns the pointer
 automatically.
 
-On first start, Windows Firewall asks whether to allow network access. Allow it on **private**
-networks. To allow it ahead of time:
+The installer adds a Windows Firewall rule for `net-mouse.exe` (UDP, inbound). Without the installer:
 
 ```
-netsh advfirewall firewall add rule name="net-mouse" dir=in action=allow protocol=UDP localport=47800
+netsh advfirewall firewall add rule name="Net Mouse" dir=in action=allow protocol=UDP localport=47800
 ```
 
 ### Command line
@@ -142,10 +148,11 @@ next to it; it never leaves the PC. Logs: `netmouse-agent.log` and `netmouse-ser
 ## How it works
 
 ```
- MASTER                                                SLAVE
- WH_MOUSE_LL hook ──► MasterEngine ──UDP multicast──► SlaveEngine ──► SendInput
- (swallows input       (layout space,                 (layout -> local coords,
-  while remote)          edge crossing)                 button reconciliation)
+ MASTER                                                      SLAVE
+ WH_MOUSE_LL /          MasterEngine      encrypted UDP      SlaveEngine          SendInput
+ WH_KEYBOARD_LL ──────► (layout space, ──── multicast ─────► (layout -> local, ──► (mouse, keys)
+ (swallow input          edge crossing,                       button/key
+  while remote)          key routing)                         reconciliation)
 ```
 
 * **Layout space** = the master's virtual-desktop coordinates in physical pixels. Every slave's monitors
@@ -219,11 +226,11 @@ same on X11, any Wayland compositor (GNOME, KDE, sway, Hyprland, ...) and the te
 
 * **Slave:** creates a *uinput* virtual **absolute** pointer, like a VM's USB tablet. The display server
   maps its range onto the whole desktop, so the master's position lands exactly where it should.
-* **Master:** grabs the physical mice exclusively through *evdev* (`EVIOCGRAB`) and owns the pointer
-  position. Local movement is re-injected through its own virtual pointer. When the pointer crosses an
-  edge that touches a slave, the movement goes to the slave instead and the real cursor waits at the
-  edge. Keyboards are read without grabbing, only for the **Ctrl+Alt+Home** emergency hotkey. If the
-  daemon stops, the kernel releases the grab and the mice work normally again.
+* **Master:** grabs the physical mice and keyboards exclusively through *evdev* (`EVIOCGRAB`) and owns
+  the pointer position. Local input is passed back through its own virtual devices. When the pointer
+  crosses an edge that touches a slave, mouse and keyboard go to the slave instead and the real cursor
+  waits at the edge. If the daemon stops, the kernel releases the grabs and mouse and keyboard work
+  normally again.
 * The **monitor layout** comes from `monitors=` in the settings (recommended), or is detected from the
   DRM connectors in `/sys/class/drm` (preferred mode, placed left to right).
 
@@ -289,8 +296,9 @@ In addition to the common ones:
 Diagnostics: `sudo net-mouse-daemon --list-devices` shows the detected monitors and mice.
 
 Testing without hardware: `sudo python3 tests/linux_e2e.py build/net-mouse-daemon` creates a fake
-mouse with uinput and runs a master and a slave on a private port. It checks edge crossing, clicks,
-wheel, the return to the master and the control socket.
+mouse and keyboard with uinput and runs a master and a slave on a private port. It checks pairing,
+edge crossing, clicks, wheel, keys, the emergency hotkey, the return to the master, interface
+selection, the control socket and that forged unencrypted packets are ignored.
 
 Prototype limitations:
 
@@ -307,16 +315,17 @@ Prototype limitations:
 
 | Path | |
 |---|---|
-| `src/core/` | portable: geometry, protocol, layout math, config, log, UDP multicast (Winsock + BSD sockets) |
+| `src/core/` | portable: geometry, protocol, crypto, keymap, layout math, config, JSON, log, UDP multicast (Winsock + BSD sockets) |
 | `src/app/` | portable role engines (`MasterEngine`, `SlaveEngine`) and the control protocol (`control_handler`) |
-| `src/platform/platform.h` | OS interfaces: displays, cursor, injector, mouse sink |
+| `src/platform/platform.h` | OS interfaces: displays, cursor, injector, input sink |
 | `src/platform/win/` | Windows: monitor enumeration, LL hooks, `SendInput`, cursor hiding, input-desktop following, control pipe |
 | `src/win/` | Windows service (`service_win.cpp`) and agent (`agent_win.cpp`) |
 | `src/ui/win/` | Windows control app: role dialog, tray icon, status window, display-arrangement editor |
 | `src/platform/linux/` | Linux: uinput virtual pointer, evdev capture, DRM/config monitor layout |
 | `src/linux/` | Linux service (`net-mouse-daemon`), control socket, settings window (`gui/net-mouse-gui.py`) |
 | `installer/`, `packaging/linux/`, `cmake/` | Inno Setup script; systemd unit, `net-mouse-ctl`, desktop entry, install/uninstall hooks |
-| `tests/` | protocol/layout/config tests, a full master↔slave session over fake platform objects, Linux end-to-end test |
+| `tests/` | unit tests (protocol, crypto, layout, keymap, JSON, control protocol), master↔slave sessions incl. pairing and attacks over fake platform objects, Linux end-to-end test |
+| `third_party/monocypher/` | Monocypher 4.0.2 (cryptography), compiled in |
 
 ## Limitations
 
