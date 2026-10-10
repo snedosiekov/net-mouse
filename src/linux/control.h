@@ -43,6 +43,5 @@ class ControlServer {
 // Client side: sends one request line and returns the reply line (empty + error on failure).
 std::string controlRequest(const std::string& path, const std::string& request, std::string& error);
 
-std::string jsonEscape(const std::string& s);
 
 }  // namespace nm

@@ -61,33 +61,6 @@ void writeAll(int fd, const std::string& data) {
 
 }  // namespace
 
-std::string jsonEscape(const std::string& s) {
-  std::string out;
-  out.reserve(s.size() + 2);
-  for (const char c : s) {
-    switch (c) {
-      case '"':
-        out += "\\\"";
-        break;
-      case '\\':
-        out += "\\\\";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      default:
-        if (static_cast<unsigned char>(c) < 0x20) {
-          char hex[8];
-          std::snprintf(hex, sizeof(hex), "\\u%04x", c);
-          out += hex;
-        } else {
-          out += c;
-        }
-    }
-  }
-  return out;
-}
-
 bool ControlServer::start(const std::string& path, Handler handler, std::string& error) {
   path_ = path;
   handler_ = std::move(handler);

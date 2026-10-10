@@ -32,14 +32,16 @@ This produces `build\installer\net-mouse-setup-<version>.exe` from [installer/ne
 The setup:
 
 * installs to `Program Files\Net Mouse` (requires administrator rights);
-* asks for the role of the PC: master, slave, or ask on first start. The role becomes
-  `--default-role`, so a role changed later from the tray menu is kept;
-* adds a Windows Firewall rule for the program;
-* **Start on Windows startup** (checked by default): registers the scheduled task **Net Mouse**. It
-  starts the app minimized to the tray when any user signs in, with highest privileges, so a slave can
-  also control administrator windows. Upgrades keep the previous choice;
-* on upgrade or uninstall asks running instances to quit (`net-mouse.exe --quit`, which restores the
-  cursor), then removes the task and the firewall rule. Per-user settings in `%APPDATA%\NetMouse` are kept.
+* installs and starts the **NetMouse Windows service** (see [Windows: service, agent and control
+  app](#windows-service-agent-and-control-app)) and adds a Windows Firewall rule for the program;
+* asks for the role of the PC: master, slave, or keep the current one / ask on first start;
+* **Start automatically with Windows** (checked by default): the service starts with Windows and the
+  control app (tray icon) at every sign-in. Unchecked, the service is set to start manually and no
+  tray icon starts by itself. Upgrades keep the previous choice;
+* moves the settings of earlier per-user versions (id, key, pairings, positions) to
+  `%ProgramData%\NetMouse` on first install, and removes their per-user autostart task;
+* on upgrade or uninstall stops the service and closes the control apps, then removes the service and
+  the firewall rule. The settings in `%ProgramData%\NetMouse` are kept.
 
 Unattended install, e.g. for a slave deployed over SSH:
 
@@ -47,13 +49,37 @@ Unattended install, e.g. for a slave deployed over SSH:
 net-mouse-setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /ROLE=slave
 ```
 
-Startup is enabled by default; add `/MERGETASKS="!autostart"` to install without it.
+Startup is enabled by default; add `/MERGETASKS="!autostart"` for a manually started service.
+
+### Windows: service, agent and control app
+
+```
+ NetMouse service (LocalSystem, session 0)
+   └─ starts and watches ─► agent: net-mouse.exe --agent (SYSTEM, console session)
+                               engine: network, encryption, hooks / SendInput
+                               follows the input desktop (normal desktop, lock/logon screen, UAC)
+                                   ▲  \\.\pipe\net-mouse-control (local only)
+                                   │
+                            control app: net-mouse.exe (each signed-in user)
+                               tray icon, arrangement window, role, network, pairing
+```
+
+* A service runs in session 0 and cannot see or drive a desktop, so it supervises an **agent** in the
+  session at the console: started as SYSTEM, restarted when it ends (backing off when it keeps
+  failing), moved when the console session changes (user switch, logoff, remote desktop).
+* The agent is the engine. As SYSTEM it can follow the **input desktop**, so a slave can be controlled at
+  its lock and logon screens and in UAC prompts, and can operate administrator windows. A master stops
+  capturing while its own screen is locked, so nobody can use the other PCs from a locked master.
+* The **control app** only shows and changes settings, through the agent's local control pipe (the same
+  requests as `net-mouse-ctl` on Linux). Closing it does not stop mouse and keyboard sharing.
+* Settings, key and logs: `%ProgramData%\NetMouse` (`netmouse.ini`, `netmouse.key` readable only by
+  SYSTEM and Administrators, `netmouse-agent.log`, `netmouse-service.log`).
 
 ## Usage
 
-1. Start `net-mouse.exe` on every PC. On first start choose the role: **Master** on the PC whose mouse
-   you use, **Slave** on the others. The choice is remembered. Change it later from the tray menu
-   (*Change role…*).
+1. Install Net Mouse on every PC and choose the role: **Master** on the PC whose mouse you use, **Slave**
+   on the others (in the installer, or on first start of the control app). Change it later from the
+   tray menu (*Change role…*).
 2. Each slave announces itself on the network. On the master, open *Arrange displays…* from the tray
    icon: the slave appears under **Available** with its name, IP and key **fingerprint**. Click it, check
    that the fingerprint matches the one shown in the slave's own Net Mouse window, and confirm. The
@@ -64,7 +90,7 @@ Startup is enabled by default; add `/MERGETASKS="!autostart"` to install without
    crosses only where screens touch. Right-click a slave screen to disconnect it.
    If a PC has several networks (VPNs, tunnels), choose the ones Net Mouse may use with *Network…* in
    the tray menu.
-4. Net Mouse runs minimized in the notification area (system tray). The mouse icon is blue when idle
+4. The control app runs minimized in the notification area (system tray). The mouse icon is blue when idle
    and turns orange while the pointer is on a slave (on a slave: while it is being controlled). Its
    tooltip shows the current state. Click the icon to open the window. Minimizing or closing the window
    hides it to the tray again, and starting the app a second time opens the running instance. On
@@ -87,17 +113,15 @@ netsh advfirewall firewall add rule name="net-mouse" dir=in action=allow protoco
 
 ### Command line
 
-| Option | Meaning |
+| Command | Meaning |
 |---|---|
-| `--config <file>` | settings file (default `%APPDATA%\NetMouse\netmouse.ini`) |
-| `--role master\|slave` | set the role without the dialog |
-| `--name <name>` | name shown to other PCs (default: computer name) |
-| `--default-role master\|slave` | role to use if none has been chosen yet (set by the installer) |
-| `--dry-run` | slave only: log received input instead of moving the cursor |
-| `--quit` | ask running instances in this session to exit cleanly |
-| `--show` | open the window at start (by default the app starts minimized to the tray) |
+| `net-mouse.exe` | control app (tray icon); `--show` opens the window at start, `--pipe NAME` talks to another agent |
+| `net-mouse.exe --quit` | close the Net Mouse windows in this session |
+| `net-mouse.exe --service` | the service itself (started by Windows) |
+| `net-mouse.exe --agent` | the engine (started by the service); `--config FILE`, `--pipe NAME`, `--role master\|slave`, `--dry-run` (slave: log input instead of injecting it) |
 
-Testing on a single PC: run a master and a `--dry-run` slave side by side, each with its own `--config`.
+Testing without the service: run `net-mouse.exe --agent --config test.ini --pipe test --dry-run` and
+`net-mouse.exe --pipe test --show`.
 
 ### Settings (`netmouse.ini`)
 
@@ -112,8 +136,8 @@ Testing on a single PC: run a master and a `--dry-run` slave side by side, each 
 | `slave.<id>.x/.y`, `slave.<id>.key` | | master: saved position and pinned public key of each connected slave |
 | `master_id`, `master_key`, `offset_x/_y`, `config_version` | | slave: the paired master and the last configuration |
 
-This PC's private key is in `netmouse.key` next to the settings file; it never leaves the PC. Logs:
-`netmouse-master.log` / `netmouse-slave.log` in the same folder.
+The settings are in `%ProgramData%\NetMouse\netmouse.ini`. This PC's private key is in `netmouse.key`
+next to it; it never leaves the PC. Logs: `netmouse-agent.log` and `netmouse-service.log` in the same folder.
 
 ## How it works
 
@@ -140,8 +164,8 @@ This PC's private key is in `netmouse.key` next to the settings file; it never l
   scan-code key events.
 * Edge crossing is blocked while a button is held, so a drag never starts on one PC and ends on another.
 
-No kernel driver is needed for this. User-mode hooks and `SendInput` cover normal desktop use (see
-[Limitations](#limitations) for the cases where a driver or service would help).
+No kernel driver is needed for this: low-level hooks and `SendInput`, run by the agent as SYSTEM on
+the input desktop, also reach the lock and logon screens and UAC prompts.
 
 ### Protocol
 
@@ -284,10 +308,11 @@ Prototype limitations:
 | Path | |
 |---|---|
 | `src/core/` | portable: geometry, protocol, layout math, config, log, UDP multicast (Winsock + BSD sockets) |
-| `src/app/` | portable role engines: `MasterEngine`, `SlaveEngine` |
+| `src/app/` | portable role engines (`MasterEngine`, `SlaveEngine`) and the control protocol (`control_handler`) |
 | `src/platform/platform.h` | OS interfaces: displays, cursor, injector, mouse sink |
-| `src/platform/win/` | Windows: monitor enumeration, LL hook, `SendInput`, cursor hiding |
-| `src/ui/win/` | Windows UI: role dialog, tray icon, status window, display-arrangement editor |
+| `src/platform/win/` | Windows: monitor enumeration, LL hooks, `SendInput`, cursor hiding, input-desktop following, control pipe |
+| `src/win/` | Windows service (`service_win.cpp`) and agent (`agent_win.cpp`) |
+| `src/ui/win/` | Windows control app: role dialog, tray icon, status window, display-arrangement editor |
 | `src/platform/linux/` | Linux: uinput virtual pointer, evdev capture, DRM/config monitor layout |
 | `src/linux/` | Linux service (`net-mouse-daemon`), control socket, settings window (`gui/net-mouse-gui.py`) |
 | `installer/`, `packaging/linux/`, `cmake/` | Inno Setup script; systemd unit, `net-mouse-ctl`, desktop entry, install/uninstall hooks |
@@ -295,11 +320,8 @@ Prototype limitations:
 
 ## Limitations
 
-* **Elevated windows on a slave:** Windows blocks `SendInput` into windows of a higher integrity
-  level (UIPI). Run the slave as administrator to control admin windows.
-* **Secure desktop** (UAC prompts, Ctrl+Alt+Del, the lock and logon screens) can't be controlled from
-  a user-session app. That needs a Windows service running in the `SYSTEM` session (or a filter
-  driver such as Interception), which is a candidate for a later iteration.
+* **Ctrl+Alt+Del** cannot be sent to a slave: Windows reserves it (the secure attention sequence).
+  Lock and logon screens and UAC prompts on a slave can be used.
 * Pointer speed is 1:1 in physical pixels. Screens with very different DPI feel different in size.
 * Several masters may share a network (a warning is logged); each slave belongs to the master that
   connected it.

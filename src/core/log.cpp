@@ -22,6 +22,13 @@ constexpr size_t kRingSize = 200;
 
 void init(const std::filesystem::path& file) {
   std::lock_guard lock(g_mutex);
+  // Long-running services: keep one previous file and start a new one beyond 2 MB.
+  std::error_code ec;
+  if (std::filesystem::file_size(file, ec) > 2 * 1024 * 1024 && !ec) {
+    std::filesystem::path old = file;
+    old += ".old";
+    std::filesystem::rename(file, old, ec);
+  }
   g_file.open(file, std::ios::app);
 }
 

@@ -3,25 +3,40 @@
 #include <windows.h>
 
 #include <bitset>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 #include <thread>
 
 #include "platform/platform.h"
 
 namespace nm {
 
+// Desktop following: input goes to one desktop at a time ("Default", or "Winlogon" for the lock and
+// logon screens and UAC prompts). Running as SYSTEM, the agent can attach to any of them.
+std::wstring inputDesktopName();
+// Attaches the calling thread (no windows or hooks on it) to the input desktop; true if attached.
+bool attachToInputDesktop();
+// attachToInputDesktop(), at most every 250 ms per thread.
+void syncInputDesktop();
+
 class WinDisplays : public IDisplays {
  public:
   std::vector<MonitorInfo> monitors() override;
 };
 
-// Hides the cursor by temporarily replacing the system cursors with a blank one; show() reloads
-// the user's cursor scheme from the registry.
+// Hides the cursor by temporarily replacing the system cursors with a blank one; show() puts back
+// copies of the cursors that were there before.
 class WinCursor : public ICursor {
  public:
   void setPos(Point p) override;
   void hide() override;
   void show() override;
   uint8_t pressedButtons() override;
+
+ private:
+  std::vector<std::pair<DWORD, HCURSOR>> saved_;  // the user's cursors while hidden
 };
 
 class WinInjector : public IInjector {
@@ -43,6 +58,8 @@ class WinInputHook {
   ~WinInputHook() { stop(); }
   bool start(IInputSink* sink);
   void stop();
+  // Desktop the hooks run on ("" when stopped).
+  std::wstring desktop() const;
 
  private:
   static LRESULT CALLBACK mouseProc(int code, WPARAM wParam, LPARAM lParam);
@@ -55,6 +72,8 @@ class WinInputHook {
   HHOOK mouseHook_ = nullptr;
   HHOOK keyboardHook_ = nullptr;
   std::bitset<1024> keysDown_;  // by evdev code, to tell auto-repeat from a new press
+  mutable std::mutex desktopMutex_;
+  std::wstring desktop_;
 };
 
 }  // namespace nm

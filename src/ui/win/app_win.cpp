@@ -1,13 +1,13 @@
-// Windows entry point: role selection, tray icon, status/arrangement window, worker threads.
+// Windows entry point. Dispatches to the service (--service), the agent (--agent) or, by default,
+// the control app: tray icon, status/arrangement window and dialogs. The control app holds no
+// engine; it shows what the agent reports over the control pipe and sends it the user's commands.
 //
-// Command line:
-//   --config <file>   settings file (default %APPDATA%\NetMouse\netmouse.ini)
-//   --role master|slave   set the role without asking
-//   --default-role master|slave   role to use if none has been chosen yet (used by the installer)
-//   --name <name>     name shown to other PCs (default: computer name)
-//   --dry-run         slave only: log received input instead of injecting it
-//   --quit            ask running instances in this session to exit, then return
-//   --show            open the window at start (by default the app starts minimized to the tray)
+// Command line (control app):
+//   --show         open the window at start (by default the app starts in the tray)
+//   --pipe NAME    control pipe of the agent (default net-mouse-control)
+//   --quit         ask Net Mouse windows in this session to close, then return
+// Agent (normally started by the service):
+//   --agent [--config FILE] [--pipe NAME] [--quit-event NAME] [--role master|slave] [--dry-run]
 
 #include <winsock2.h>
 #include <windows.h>
@@ -17,72 +17,70 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <filesystem>
 #include <format>
-#include <memory>
-#include <random>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
 #include "app/master_engine.h"
-#include "app/network_loop.h"
 #include "app/slave_engine.h"
 #include "core/config.h"
-#include "core/crypto.h"
-#include "core/log.h"
-#include "core/protocol.h"
+#include "core/json.h"
 #include "core/udp.h"
-#include "platform/win/win_platform.h"
+#include "platform/win/win_common.h"
 #include "ui/win/layout_view.h"
 #include "ui/win/network_dialog.h"
 #include "ui/win/resource_ids.h"
+#include "win/entry.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 namespace fs = std::filesystem;
 using namespace nm;
+using nm::win::narrow;
+using nm::win::widen;
 
 namespace {
 
-// The class name carries the role ("NetMouseMainWindow-master"), so a second start finds the instance
-// with the same role; --quit matches the prefix.
-constexpr wchar_t kWindowClassPrefix[] = L"NetMouseMainWindow";
+// Older versions used "NetMouseMainWindow-<role>"; --quit matches every "NetMouse..." window.
+constexpr wchar_t kWindowClass[] = L"NetMouseControlWindow";
+constexpr wchar_t kWindowClassPrefix[] = L"NetMouse";
 constexpr wchar_t kAppTitle[] = L"Net Mouse";
 constexpr UINT WM_TRAY = WM_APP + 1;
+constexpr UINT WM_STATUS = WM_APP + 2;  // the poll thread got a new status
 constexpr UINT_PTR kRefreshTimer = 1;
 constexpr UINT kTrayId = 1;
-enum : UINT { IDM_SHOW = 100, IDM_RETURN, IDM_CHANGE_ROLE, IDM_FORGET_MASTER, IDM_DISCONNECT, IDM_EXIT, IDM_NETWORK };
+enum : UINT { IDM_SHOW = 100, IDM_RETURN, IDM_CHANGE_ROLE, IDM_FORGET_MASTER, IDM_DISCONNECT, IDM_EXIT, IDM_NETWORK,
+              IDM_START_SERVICE };
 
-constexpr char kDefaultGroup[] = "239.255.77.77";
-constexpr int kDefaultPort = 47800;
+// What the agent reports ("status" over the pipe), converted for the UI.
+struct Status {
+  bool reachable = false;
+  std::string role;  // "" = no role chosen yet
+  std::string name;
+  std::string fingerprint;
+  std::string group;
+  int port = 0;
+  std::vector<std::string> log;
+  std::vector<std::string> filter;
+  std::vector<UdpMulticast::Choice> choices;
+  MasterSnapshot master;
+  SlaveSnapshot slave;
+};
 
 struct App {
-  // Command line
-  std::wstring configArg;
-  std::string roleArg;
-  std::string defaultRoleArg;
-  bool quit = false;
+  std::wstring pipe = win::kDefaultPipe;
   bool show = false;
-  std::string nameArg;
-  bool dryRun = false;
+  fs::path prefsPath;  // %APPDATA%\NetMouse\control.ini (window hints only)
 
-  Config config;
-  std::string role;
-  uint64_t id = 0;
-  std::string name;
-  std::string group;
-  int port = kDefaultPort;
-
-  UdpMulticast net;
-  WinDisplays displays;
-  WinCursor cursor;
-  std::unique_ptr<WinInjector> injector;
-  std::unique_ptr<MasterEngine> master;
-  std::unique_ptr<SlaveEngine> slave;
-  WinInputHook hook;
-  std::thread netThread;
-  std::atomic<bool> running{true};
+  std::mutex statusMutex;
+  Status status;
+  std::string lastRaw;
+  std::atomic<bool> polling{true};
+  std::thread poller;
+  bool roleAsked = false;
 
   HWND hwnd = nullptr;
   HFONT font = nullptr;
@@ -90,9 +88,6 @@ struct App {
   UINT dpi = 96;
   UINT taskbarCreatedMsg = 0;
   ui::LayoutView layoutView;
-  uint64_t paintedChange = ~0ull;
-  uint64_t paintedLog = ~0ull;
-  bool restart = false;
 
   HICON iconIdle = nullptr;
   HICON iconActive = nullptr;
@@ -100,81 +95,139 @@ struct App {
   std::wstring trayTip;
   bool showTrayHint = false;
   bool closeHintShown = false;  // "still running" balloon after the first window close
-  uint64_t menuSlave = 0;  // slave the canvas context menu is about  // first run: tell the user where the app went
+  uint64_t menuSlave = 0;       // slave the canvas context menu is about
 };
 
 App g;
 
-std::wstring widen(const std::string& s) {
-  if (s.empty()) return {};
-  const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-  std::wstring w(static_cast<size_t>(n), L'\0');
-  MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
-  return w;
+Status currentStatus() {
+  std::lock_guard lock(g.statusMutex);
+  return g.status;
 }
 
-std::string narrow(const std::wstring& w) {
-  if (w.empty()) return {};
-  const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-  std::string s(static_cast<size_t>(n), '\0');
-  WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+bool isMaster(const Status& s) { return s.reachable && s.role == "master"; }
+
+uint64_t parseHexId(const std::string& text) {
+  try {
+    return std::stoull(text, nullptr, 16);
+  } catch (...) {
+    return 0;
+  }
+}
+
+uint32_t parseIpOrZero(const std::string& text) {
+  uint32_t ip = 0;
+  return parseIp(text, ip) ? ip : 0;
+}
+
+std::vector<MonitorInfo> parseMonitors(const json::Value& list) {
+  std::vector<MonitorInfo> out;
+  for (const json::Value& m : list.a) {
+    const int32_t x = static_cast<int32_t>(m["x"].asInt()), y = static_cast<int32_t>(m["y"].asInt());
+    out.push_back({{x, y, x + static_cast<int32_t>(m["w"].asInt()), y + static_cast<int32_t>(m["h"].asInt())},
+                   m["primary"].asBool(), m["name"].asString()});
+  }
+  return out;
+}
+
+Status parseStatus(const json::Value& v) {
+  Status s;
+  s.reachable = true;
+  s.role = v["role"].asString();
+  s.name = v["name"].asString();
+  s.fingerprint = v["fingerprint"].asString();
+  s.group = v["group"].asString();
+  s.port = static_cast<int>(v["port"].asInt());
+  for (const json::Value& line : v["log"].a) s.log.push_back(line.asString());
+  s.filter = parseInterfaceList(v["interface_filter"].asString());
+  for (const json::Value& i : v["interfaces"].a) {
+    s.choices.push_back({NetInterface{parseIpOrZero(i["ip"].asString()), 0, i["name"].asString()}, i["selected"].asBool()});
+  }
+  if (s.role == "master") {
+    MasterSnapshot& m = s.master;
+    m.masterMonitors = parseMonitors(v["monitors"]);
+    m.remote = v["remote"].asBool();
+    m.activeSlave = parseHexId(v["active"].asString());
+    m.virtualPos = {static_cast<int32_t>(v["pointer"]["x"].asInt()), static_cast<int32_t>(v["pointer"]["y"].asInt())};
+    m.fingerprint = s.fingerprint;
+    for (const json::Value& j : v["slaves"].a) {
+      SlaveView sv;
+      sv.id = parseHexId(j["id"].asString());
+      sv.name = j["name"].asString();
+      sv.ip = parseIpOrZero(j["ip"].asString());
+      sv.online = j["online"].asBool();
+      sv.paired = j["paired"].asBool();
+      sv.connected = j["connected"].asBool();
+      sv.synced = j["synced"].asBool();
+      sv.keyMismatch = j["key_mismatch"].asBool();
+      sv.otherMaster = j["other_master"].asBool();
+      sv.fingerprint = j["fingerprint"].asString();
+      sv.offset = {static_cast<int32_t>(j["offset"]["x"].asInt()), static_cast<int32_t>(j["offset"]["y"].asInt())};
+      for (const MonitorInfo& mi : parseMonitors(j["monitors"])) sv.monitors.push_back(mi.rect);
+      m.slaves.push_back(std::move(sv));
+    }
+  } else if (s.role == "slave") {
+    SlaveSnapshot& sl = s.slave;
+    sl.paired = v["paired"].asBool();
+    sl.connected = v["connected"].asBool();
+    sl.configured = v["configured"].asBool();
+    sl.active = v["active"].asBool();
+    sl.offset = {static_cast<int32_t>(v["offset"]["x"].asInt()), static_cast<int32_t>(v["offset"]["y"].asInt())};
+    sl.monitors = parseMonitors(v["monitors"]);
+    sl.fingerprint = s.fingerprint;
+    const json::Value& m = v["master"];
+    sl.masterId = parseHexId(m["id"].asString());
+    sl.masterName = m["name"].asString();
+    sl.masterIp = parseIpOrZero(m["ip"].asString());
+    sl.masterOnline = m["online"].asBool();
+    sl.masterFingerprint = m["fingerprint"].asString();
+  }
   return s;
 }
 
-std::wstring windowClass() { return std::wstring(kWindowClassPrefix) + L"-" + widen(g.role); }
-
-uint64_t randomId() {
-  std::random_device rd;
-  uint64_t id = 0;
-  while (id == 0) id = (static_cast<uint64_t>(rd()) << 32) | rd();
-  return id;
-}
-
-std::string computerName() {
-  wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1];
-  DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
-  return GetComputerNameW(buf, &size) ? narrow(buf) : "pc";
-}
-
-fs::path defaultConfigPath() {
-  wchar_t buf[MAX_PATH];
-  const DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
-  fs::path base = (n > 0 && n < MAX_PATH) ? fs::path(buf) : fs::current_path();
-  return base / L"NetMouse" / L"netmouse.ini";
-}
-
-void parseArgs() {
-  int argc = 0;
-  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-  for (int i = 1; i < argc; ++i) {
-    const std::wstring a = argv[i];
-    const bool hasValue = i + 1 < argc;
-    if (a == L"--config" && hasValue) {
-      g.configArg = argv[++i];
-    } else if (a == L"--role" && hasValue) {
-      g.roleArg = narrow(argv[++i]);
-    } else if (a == L"--name" && hasValue) {
-      g.nameArg = narrow(argv[++i]);
-    } else if (a == L"--default-role" && hasValue) {
-      g.defaultRoleArg = narrow(argv[++i]);
-    } else if (a == L"--dry-run") {
-      g.dryRun = true;
-    } else if (a == L"--quit") {
-      g.quit = true;
-    } else if (a == L"--show") {
-      g.show = true;
+// Polls the agent; the window is told when something changed.
+void pollLoop() {
+  while (g.polling) {
+    const std::optional<std::string> reply = win::pipeRequest(g.pipe, "status", 1000);
+    std::optional<json::Value> parsed = reply ? json::parse(*reply) : std::nullopt;
+    const std::string raw = parsed ? *reply : std::string();
+    bool changed = false;
+    {
+      std::lock_guard lock(g.statusMutex);
+      if (raw != g.lastRaw || (parsed.has_value() != g.status.reachable)) {
+        g.lastRaw = raw;
+        g.status = parsed ? parseStatus(*parsed) : Status{};
+        changed = true;
+      }
     }
+    if (changed && g.hwnd) PostMessageW(g.hwnd, WM_STATUS, 0, 0);
+    for (int i = 0; i < 6 && g.polling; ++i) Sleep(50);
   }
-  LocalFree(argv);
 }
 
-std::string chooseRole() {
+// Sends a command to the agent; shows its error, if any. True on success.
+bool command(HWND hwnd, const std::string& request) {
+  const std::optional<std::string> reply = win::pipeRequest(g.pipe, request, 3000);
+  if (!reply) {
+    MessageBoxW(hwnd, L"The Net Mouse service is not running.", kAppTitle, MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  if (reply->rfind("error", 0) == 0) {
+    MessageBoxW(hwnd, widen(reply->substr(std::min<size_t>(6, reply->size()))).c_str(), kAppTitle,
+                MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  return true;
+}
+
+std::string chooseRole(HWND owner) {
   const TASKDIALOG_BUTTON buttons[] = {
-      {1001, L"Master\nThis PC's mouse controls this PC and the slave PCs."},
-      {1002, L"Slave\nThis PC is controlled by the master PC's mouse."},
+      {1001, L"Master\nThis PC's mouse and keyboard control this PC and the slave PCs."},
+      {1002, L"Slave\nThis PC is controlled by the master PC's mouse and keyboard."},
   };
   TASKDIALOGCONFIG c{};
   c.cbSize = sizeof(c);
+  c.hwndParent = owner;
   c.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION;
   c.pszWindowTitle = kAppTitle;
   c.pszMainIcon = TD_INFORMATION_ICON;
@@ -192,11 +245,6 @@ std::string chooseRole() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Worker threads
-
-void networkLoop() { runNetworkLoop(g.net, g.master.get(), g.slave.get(), g.running); }
-
-// ---------------------------------------------------------------------------------------------
 // Window
 
 void updateFonts() {
@@ -211,12 +259,18 @@ void updateFonts() {
   g.bigFont = make(11, FW_SEMIBOLD);
 }
 
-std::wstring statusText() {
+std::wstring statusText(const Status& st) {
   std::wstring t;
-  if (g.master) {
-    const MasterSnapshot s = g.master->snapshot();
-    t += std::format(L"MASTER • {} • fingerprint {} • group {}:{}\n", widen(g.name),
-                     widen(s.fingerprint), widen(g.group), g.port);
+  if (!st.reachable) {
+    return L"The Net Mouse service is not running on this PC.\n\n"
+           L"Start it from the tray menu (“Start Net Mouse service”), or in Windows “Services”. "
+           L"Mouse and keyboard sharing runs in that service; this window only shows and changes its settings.";
+  }
+  if (st.role.empty()) return L"No role chosen yet for this PC: choose one in the dialog, or from the tray menu.";
+  if (st.role == "master") {
+    const MasterSnapshot& s = st.master;
+    t += std::format(L"MASTER • {} • fingerprint {} • group {}:{}\n", widen(st.name),
+                     widen(st.fingerprint), widen(st.group), st.port);
     if (s.remote) {
       std::string target = "?";
       for (const SlaveView& v : s.slaves) {
@@ -247,12 +301,12 @@ std::wstring statusText() {
     t += L"Click an available PC to connect it, drag connected screens to where they are; right-click one to "
          L"disconnect.\n";
   } else {
-    const SlaveSnapshot s = g.slave->snapshot();
-    t += std::format(L"SLAVE • {} • fingerprint {}\n", widen(g.name), widen(s.fingerprint));
+    const SlaveSnapshot& s = st.slave;
+    t += std::format(L"SLAVE • {} • fingerprint {}\n", widen(st.name), widen(st.fingerprint));
     if (!s.paired) {
       t += s.masterOnline
                ? std::format(L"Not connected. On the master \"{}\", click this PC (fingerprint {}) under Available.\n",
-                             widen(s.masterName), widen(s.fingerprint))
+                             widen(s.masterName), widen(st.fingerprint))
                : std::wstring(L"Not connected. Looking for a master on the local network…\n");
     } else {
       t += std::format(L"Paired with master \"{}\" (fingerprint {}) • {}\n", widen(s.masterName),
@@ -268,13 +322,12 @@ std::wstring statusText() {
       t += std::format(L"  Monitor {}: {}×{} at ({}, {}){}\n", i + 1, r.width(), r.height(), r.left, r.top,
                        s.monitors[i].primary ? L" primary" : L"");
     }
-    if (g.dryRun) t += L"DRY RUN: input is logged, not injected\n";
   }
-  const auto filter = g.net.filter();
-  t += L"Network: " + (filter.empty() ? std::wstring(L"all interfaces") : widen(joinInterfaceList(filter))) +
-       L"  (tray menu \u2192 Network\u2026)\n";
+  t += L"Network: " + (st.filter.empty() ? std::wstring(L"all interfaces") : widen(joinInterfaceList(st.filter))) +
+       L"  (tray menu → Network…)\n";
   t += L"\nRecent events:\n";
-  for (const std::string& line : log::recent(6)) t += widen(line) + L"\n";
+  const size_t from = st.log.size() > 6 ? st.log.size() - 6 : 0;
+  for (size_t i = from; i < st.log.size(); ++i) t += widen(st.log[i]) + L"\n";
   return t;
 }
 
@@ -289,20 +342,22 @@ void loadIcons(HINSTANCE instance) {
 }
 
 // Current tray state: "active" means the pointer is on a slave (master) or controlled by the master (slave).
-std::pair<bool, std::wstring> trayState() {
-  std::wstring tip = std::format(L"Net Mouse – {} ({})", g.master ? L"master" : L"slave", widen(g.name));
+std::pair<bool, std::wstring> trayState(const Status& st) {
+  if (!st.reachable) return {false, L"Net Mouse – service not running"};
+  if (st.role.empty()) return {false, L"Net Mouse – no role chosen"};
+  std::wstring tip = std::format(L"Net Mouse – {} ({})", widen(st.role), widen(st.name));
   bool active = false;
-  if (g.master) {
-    const MasterSnapshot s = g.master->snapshot();
+  if (st.role == "master") {
+    const MasterSnapshot& s = st.master;
     active = s.remote;
     size_t online = 0;
     for (const SlaveView& v : s.slaves) {
-      if (v.online) ++online;
+      if (v.online && v.connected) ++online;
       if (s.remote && v.id == s.activeSlave) tip += L"\nPointer on " + widen(v.name);
     }
-    if (!s.remote) tip += std::format(L"\n{} slave(s) online", online);
+    if (!s.remote) tip += std::format(L"\n{} slave(s) connected", online);
   } else {
-    const SlaveSnapshot s = g.slave->snapshot();
+    const SlaveSnapshot& s = st.slave;
     active = s.active;
     if (s.active) {
       tip += L"\nControlled by " + widen(s.masterName);
@@ -315,34 +370,20 @@ std::pair<bool, std::wstring> trayState() {
   return {active, tip};
 }
 
-void addTrayIcon() {
-  const auto [active, tip] = trayState();
+void setTrayIcon(DWORD action) {
+  const auto [active, tip] = trayState(currentStatus());
+  if (action == NIM_MODIFY && active == g.trayActive && tip == g.trayTip) return;
   g.trayActive = active;
   g.trayTip = tip;
   NOTIFYICONDATAW nid{};
   nid.cbSize = sizeof(nid);
   nid.hWnd = g.hwnd;
   nid.uID = kTrayId;
-  nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+  nid.uFlags = NIF_ICON | NIF_TIP | (action == NIM_ADD ? NIF_MESSAGE : 0);
   nid.uCallbackMessage = WM_TRAY;
   nid.hIcon = active ? g.iconActive : g.iconIdle;
   wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
-  Shell_NotifyIconW(NIM_ADD, &nid);
-}
-
-void updateTrayIcon() {
-  const auto [active, tip] = trayState();
-  if (active == g.trayActive && tip == g.trayTip) return;
-  g.trayActive = active;
-  g.trayTip = tip;
-  NOTIFYICONDATAW nid{};
-  nid.cbSize = sizeof(nid);
-  nid.hWnd = g.hwnd;
-  nid.uID = kTrayId;
-  nid.uFlags = NIF_ICON | NIF_TIP;
-  nid.hIcon = active ? g.iconActive : g.iconIdle;
-  wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
-  Shell_NotifyIconW(NIM_MODIFY, &nid);
+  Shell_NotifyIconW(action, &nid);
 }
 
 void showTrayBalloon(const wchar_t* title, const wchar_t* text) {
@@ -358,12 +399,6 @@ void showTrayBalloon(const wchar_t* title, const wchar_t* text) {
   Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-void showTrayHint() {
-  showTrayBalloon(L"Net Mouse is running",
-                  g.master ? L"It runs in the notification area. Click the mouse icon to arrange the slave screens."
-                           : L"It runs in the notification area. Click the mouse icon to see the status.");
-}
-
 void removeTrayIcon() {
   NOTIFYICONDATAW nid{};
   nid.cbSize = sizeof(nid);
@@ -373,12 +408,17 @@ void removeTrayIcon() {
 }
 
 void showTrayMenu() {
+  const Status st = currentStatus();
   HMENU menu = CreatePopupMenu();
-  AppendMenuW(menu, MF_STRING, IDM_SHOW, g.master ? L"Arrange displays…" : L"Status…");
-  if (g.master) AppendMenuW(menu, MF_STRING, IDM_RETURN, L"Return pointer to this PC\tCtrl+Alt+Home");
-  if (g.slave && g.slave->snapshot().paired) AppendMenuW(menu, MF_STRING, IDM_FORGET_MASTER, L"Forget master…");
-  AppendMenuW(menu, MF_STRING, IDM_NETWORK, L"Network…");
-  AppendMenuW(menu, MF_STRING, IDM_CHANGE_ROLE, L"Change role…");
+  AppendMenuW(menu, MF_STRING, IDM_SHOW, isMaster(st) ? L"Arrange displays…" : L"Status…");
+  if (!st.reachable) {
+    AppendMenuW(menu, MF_STRING, IDM_START_SERVICE, L"Start Net Mouse service");
+  } else {
+    if (isMaster(st)) AppendMenuW(menu, MF_STRING, IDM_RETURN, L"Return pointer to this PC\tCtrl+Alt+Home");
+    if (st.role == "slave" && st.slave.paired) AppendMenuW(menu, MF_STRING, IDM_FORGET_MASTER, L"Forget master…");
+    if (!st.role.empty()) AppendMenuW(menu, MF_STRING, IDM_NETWORK, L"Network…");
+    AppendMenuW(menu, MF_STRING, IDM_CHANGE_ROLE, st.role.empty() ? L"Choose role…" : L"Change role…");
+  }
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Close Net Mouse");
   SetMenuDefaultItem(menu, IDM_SHOW, FALSE);
@@ -401,6 +441,7 @@ RECT layoutArea(const RECT& client) {
 }
 
 void paint(HWND hwnd) {
+  const Status st = currentStatus();
   PAINTSTRUCT ps;
   HDC hdc = BeginPaint(hwnd, &ps);
   RECT client;
@@ -411,18 +452,18 @@ void paint(HWND hwnd) {
   FillRect(dc, &client, GetSysColorBrush(COLOR_WINDOW));
 
   RECT textArea = client;
-  if (g.master) {
+  if (isMaster(st)) {
     const RECT area = layoutArea(client);
-    g.layoutView.paint(dc, area, g.master->snapshot(), g.font, g.dpi);
+    g.layoutView.paint(dc, area, st.master, g.font, g.dpi);
     textArea.top = area.bottom;
   }
   const int pad = MulDiv(10, static_cast<int>(g.dpi), 96);
   InflateRect(&textArea, -pad, -pad);
   SetBkMode(dc, TRANSPARENT);
   SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-  HGDIOBJ oldFont = SelectObject(dc, g.master ? g.font : g.bigFont);
-  const std::wstring text = statusText();
-  DrawTextW(dc, text.c_str(), -1, &textArea, DT_LEFT | DT_NOPREFIX | DT_EXPANDTABS | DT_END_ELLIPSIS);
+  HGDIOBJ oldFont = SelectObject(dc, isMaster(st) ? g.font : g.bigFont);
+  const std::wstring text = statusText(st);
+  DrawTextW(dc, text.c_str(), -1, &textArea, DT_LEFT | DT_NOPREFIX | DT_EXPANDTABS | DT_WORDBREAK | DT_END_ELLIPSIS);
   SelectObject(dc, oldFont);
 
   BitBlt(hdc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -441,8 +482,8 @@ const SlaveView* findSlave(const MasterSnapshot& snap, uint64_t id) {
 
 // Pairing: the user confirms the PC by its fingerprint, which the slave shows in its own window.
 void connectSlave(HWND hwnd, uint64_t id) {
-  const MasterSnapshot snap = g.master->snapshot();
-  const SlaveView* v = findSlave(snap, id);
+  const Status st = currentStatus();
+  const SlaveView* v = findSlave(st.master, id);
   if (!v) return;
   if (v->otherMaster) {
     const std::wstring text = std::format(
@@ -464,24 +505,35 @@ void connectSlave(HWND hwnd, uint64_t id) {
       IDOK) {
     return;
   }
-  if (v->keyMismatch) g.master->unpairSlave(id);
-  if (!g.master->pairSlave(id)) MessageBoxW(hwnd, L"That PC is no longer available.", kAppTitle, MB_OK | MB_ICONWARNING);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  const std::string hex = toHex(id);
+  if (v->keyMismatch) command(hwnd, "unpair " + hex);
+  command(hwnd, "pair " + hex);
 }
 
 void disconnectSlave(HWND hwnd, uint64_t id) {
-  const MasterSnapshot snap = g.master->snapshot();
-  const SlaveView* v = findSlave(snap, id);
+  const Status st = currentStatus();
+  const SlaveView* v = findSlave(st.master, id);
   if (!v) return;
   const std::wstring text =
       std::format(L"Disconnect \"{}\"?\n\nThis master stops controlling it; it goes back to Available.", widen(v->name));
-  if (MessageBoxW(hwnd, text.c_str(), kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) g.master->unpairSlave(id);
-  InvalidateRect(hwnd, nullptr, FALSE);
+  if (MessageBoxW(hwnd, text.c_str(), kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+    command(hwnd, "unpair " + toHex(id));
+  }
+}
+
+void askRole(HWND hwnd) {
+  const std::string role = chooseRole(hwnd);
+  if (!role.empty()) command(hwnd, "set-role " + role);  // the service restarts the agent with it
+}
+
+// Starting the service needs administrator rights: ask via UAC.
+void startService(HWND hwnd) {
+  ShellExecuteW(hwnd, L"runas", L"sc.exe", L"start NetMouse", nullptr, SW_HIDE);
 }
 
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   if (g.taskbarCreatedMsg && msg == g.taskbarCreatedMsg) {
-    addTrayIcon();  // Explorer restarted
+    setTrayIcon(NIM_ADD);  // Explorer restarted
     return 0;
   }
   switch (msg) {
@@ -489,21 +541,26 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       g.hwnd = hwnd;
       g.dpi = GetDpiForWindow(hwnd);
       updateFonts();
-      addTrayIcon();
-      if (g.showTrayHint) showTrayHint();
-      SetTimer(hwnd, kRefreshTimer, 150, nullptr);
+      setTrayIcon(NIM_ADD);
+      if (g.showTrayHint) {
+        showTrayBalloon(L"Net Mouse is running",
+                        L"It runs in the notification area. Click the mouse icon for the settings.");
+      }
+      SetTimer(hwnd, kRefreshTimer, 1000, nullptr);
       return 0;
-    case WM_TIMER: {
-      const uint64_t change = g.master ? g.master->changeCounter() : g.slave->changeCounter();
-      const uint64_t logCount = log::counter();
-      updateTrayIcon();
-      if (IsWindowVisible(hwnd) && (change != g.paintedChange || logCount != g.paintedLog)) {
-        g.paintedChange = change;
-        g.paintedLog = logCount;
-        InvalidateRect(hwnd, nullptr, FALSE);
+    case WM_STATUS: {
+      setTrayIcon(NIM_MODIFY);
+      if (IsWindowVisible(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+      const Status st = currentStatus();
+      if (st.reachable && st.role.empty() && !g.roleAsked) {
+        g.roleAsked = true;  // ask once per run; afterwards from the tray menu
+        askRole(hwnd);
       }
       return 0;
     }
+    case WM_TIMER:
+      setTrayIcon(NIM_MODIFY);
+      return 0;
     case WM_PAINT:
       paint(hwnd);
       return 0;
@@ -524,37 +581,40 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                    suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
       return 0;
     }
-    case WM_LBUTTONDOWN:
-      if (g.master) {
-        if (auto id = g.layoutView.availableAt({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) {
-          connectSlave(hwnd, *id);
-          return 0;
-        }
+    case WM_LBUTTONDOWN: {
+      if (!isMaster(currentStatus())) return 0;
+      const POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      if (auto id = g.layoutView.availableAt(pt)) {
+        connectSlave(hwnd, *id);
+        return 0;
       }
-      if (g.master && g.layoutView.beginDrag({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)})) {
+      if (g.layoutView.beginDrag(pt)) {
         SetCapture(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
+    }
     case WM_MOUSEMOVE:
-      if (g.master && g.layoutView.dragging()) {
+      if (g.layoutView.dragging()) {
         g.layoutView.dragTo({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
     case WM_LBUTTONUP:
     case WM_CAPTURECHANGED:
-      if (g.master && g.layoutView.dragging()) {
+      if (g.layoutView.dragging()) {
         if (msg == WM_LBUTTONUP) g.layoutView.dragTo({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
         if (auto drop = g.layoutView.endDrag()) {
-          if (!g.master->setSlaveOffset(drop->slaveId, drop->offset)) MessageBeep(MB_ICONWARNING);
+          const auto reply = win::pipeRequest(g.pipe, std::format("set-offset {} {} {}", toHex(drop->slaveId),
+                                                                 drop->offset.x, drop->offset.y));
+          if (!reply || reply->rfind("ok", 0) != 0) MessageBeep(MB_ICONWARNING);
         }
         if (msg == WM_LBUTTONUP) ReleaseCapture();
         InvalidateRect(hwnd, nullptr, FALSE);
       }
       return 0;
     case WM_RBUTTONUP:
-      if (g.master) {
+      if (isMaster(currentStatus())) {
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         if (auto id = g.layoutView.slaveAt(pt)) {
           g.menuSlave = *id;
@@ -586,34 +646,31 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
           showWindow();
           break;
         case IDM_RETURN:
-          if (g.master) g.master->onPanic();
+          command(hwnd, "return");
           break;
         case IDM_DISCONNECT:
           disconnectSlave(hwnd, g.menuSlave);
           break;
-        case IDM_NETWORK:
-          if (auto selection = ui::showNetworkDialog(hwnd, g.net.choices(), g.net.filter().empty(), g.font, g.dpi)) {
-            g.config.set("interfaces", joinInterfaceList(*selection));
-            g.config.erase("interface");
-            g.config.save();
-            g.net.setFilter(*selection);  // takes effect immediately
-            InvalidateRect(hwnd, nullptr, FALSE);
+        case IDM_NETWORK: {
+          const Status st = currentStatus();
+          if (auto selection = ui::showNetworkDialog(hwnd, st.choices, st.filter.empty(), g.font, g.dpi)) {
+            command(hwnd, "set-interfaces " + (selection->empty() ? std::string("all") : joinInterfaceList(*selection)));
           }
           break;
+        }
         case IDM_FORGET_MASTER:
-          if (g.slave && MessageBoxW(hwnd,
-                                     L"Forget the master this PC is paired with?\n\nIt will no longer control this PC "
-                                     L"until a master connects it again.",
-                                     kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
-            g.slave->forgetMaster();
+          if (MessageBoxW(hwnd,
+                          L"Forget the master this PC is paired with?\n\nIt will no longer control this PC until a "
+                          L"master connects it again.",
+                          kAppTitle, MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
+            command(hwnd, "forget-master");
           }
           break;
         case IDM_CHANGE_ROLE:
-          if (MessageBoxW(hwnd, L"Net Mouse will restart and ask for the role of this PC.", kAppTitle,
-                          MB_OKCANCEL | MB_ICONQUESTION) == IDOK) {
-            g.restart = true;
-            DestroyWindow(hwnd);
-          }
+          askRole(hwnd);
+          break;
+        case IDM_START_SERVICE:
+          startService(hwnd);
           break;
         case IDM_EXIT:
           DestroyWindow(hwnd);
@@ -654,41 +711,25 @@ bool createWindow(HINSTANCE instance) {
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP));
   wc.hIconSm = g.iconIdle;
-  const std::wstring className = windowClass();
-  wc.lpszClassName = className.c_str();
+  wc.lpszClassName = kWindowClass;
   if (!RegisterClassExW(&wc)) return false;
 
   g.taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
   const UINT dpi = GetDpiForSystem();
-  const int w = MulDiv(g.master ? 1040 : 640, static_cast<int>(dpi), 96);
-  const int h = MulDiv(g.master ? 760 : 360, static_cast<int>(dpi), 96);
-  const std::wstring title = std::format(L"{} – {} ({})", kAppTitle, g.master ? L"Master" : L"Slave", widen(g.name));
-  return CreateWindowExW(0, className.c_str(), title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h,
+  const int w = MulDiv(1040, static_cast<int>(dpi), 96);
+  const int h = MulDiv(760, static_cast<int>(dpi), 96);
+  const std::wstring title = std::format(L"{} – {}", kAppTitle, widen(win::computerName()));
+  return CreateWindowExW(0, kWindowClass, title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, w, h,
                          nullptr, nullptr, instance, nullptr) != nullptr;
 }
 
-void relaunch() {
-  wchar_t exe[MAX_PATH];
-  GetModuleFileNameW(nullptr, exe, MAX_PATH);
-  std::wstring cmd = L"\"" + std::wstring(exe) + L"\"";
-  if (!g.configArg.empty()) cmd += L" --config \"" + g.configArg + L"\"";
-  if (g.dryRun) cmd += L" --dry-run";
-  STARTUPINFOW si{};
-  si.cb = sizeof(si);
-  PROCESS_INFORMATION pi{};
-  if (CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-  }
-}
-
-// Posts "Exit" to every Net Mouse window in this session; they shut down cleanly (cursor restored).
+// Posts "Exit" to every Net Mouse window in this session (also those of older versions).
 int quitRunningInstances() {
   EnumWindows(
       [](HWND hwnd, LPARAM) -> BOOL {
         wchar_t cls[64];
-        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) &&
-            wcsncmp(cls, kWindowClassPrefix, wcslen(kWindowClassPrefix)) == 0) {
+        if (GetClassNameW(hwnd, cls, ARRAYSIZE(cls)) && wcsncmp(cls, kWindowClassPrefix, wcslen(kWindowClassPrefix)) == 0 &&
+            wcscmp(cls, L"NetMouseNetworkDialog") != 0) {
           PostMessageW(hwnd, WM_COMMAND, IDM_EXIT, 0);
         }
         return TRUE;
@@ -697,136 +738,95 @@ int quitRunningInstances() {
   return 0;
 }
 
-int fail(const std::wstring& message) {
-  log::info("Fatal: " + narrow(message));
-  MessageBoxW(nullptr, message.c_str(), kAppTitle, MB_OK | MB_ICONERROR);
-  return 1;
-}
-
-}  // namespace
-
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
-  // Physical pixels everywhere: hook coordinates, SetCursorPos and SendInput then agree.
+int runControlApp(HINSTANCE instance) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_STANDARD_CLASSES};
   InitCommonControlsEx(&icc);
-  parseArgs();
-  if (g.quit) return quitRunningInstances();
 
-  const fs::path configPath = g.configArg.empty() ? defaultConfigPath() : fs::path(g.configArg);
-  g.config.load(configPath);
-
-  g.role = !g.roleArg.empty() ? g.roleArg : g.config.get("role");
-  if (g.role.empty()) g.role = g.defaultRoleArg;
-  if (g.role != "master" && g.role != "slave") {
-    g.role = chooseRole();
-    if (g.role.empty()) return 0;
-  }
-  g.config.set("role", g.role);
-  g.id = g.config.getHex("id");
-  if (g.id == 0) {
-    g.id = randomId();
-    g.config.setHex("id", g.id);
-  }
-  if (!g.nameArg.empty()) g.config.set("name", g.nameArg);
-  g.name = g.config.get("name", computerName());
-  g.group = g.config.get("group", kDefaultGroup);
-  g.port = static_cast<int>(g.config.getInt("port", kDefaultPort));
-  if (!g.config.has("group")) g.config.set("group", g.group);
-  if (!g.config.has("port")) g.config.setInt("port", g.port);
-  if (!g.config.has("interfaces")) g.config.set("interfaces", "");
-  if (g.role == "master" && !g.config.has("hide_cursor")) g.config.setInt("hide_cursor", 1);
-  g.showTrayHint = g.config.getInt("tray_hint_shown", 0) == 0;
-  g.config.setInt("tray_hint_shown", 1);
-  g.config.save();
-
-  std::error_code ec;
-  fs::create_directories(configPath.parent_path(), ec);
-  log::init(configPath.parent_path() / ("netmouse-" + g.role + ".log"));
-  log::info(std::format("Starting as {} '{}' (id {}), config {}", g.role, g.name, toHex(g.id), configPath.string()));
-
-  // One instance per role per PC (a master and a slave may run side by side for testing).
-  const std::wstring mutexName = L"Local\\NetMouse-" + widen(g.role);
-  HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
+  // One control app per session; starting it again opens the window of the running one.
+  HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\NetMouseControl");
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    // Started again (e.g. from the Start menu) while running in the tray: open the existing window.
     if (instanceMutex) CloseHandle(instanceMutex);
-    if (HWND existing = FindWindowW(windowClass().c_str(), nullptr)) {
+    if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
       AllowSetForegroundWindow(ASFW_ANY);
       PostMessageW(existing, WM_COMMAND, IDM_SHOW, 0);
-      return 0;
     }
-    return fail(L"Net Mouse is already running as " + widen(g.role) + L" on this PC.");
+    return 0;
   }
 
-  std::string error;
-  // Network interfaces to use: "interfaces" (names or addresses; empty = all), or the older
-  // single-address "interface" setting.
-  std::vector<std::string> interfaces = parseInterfaceList(g.config.get("interfaces"));
-  if (interfaces.empty() && !g.config.get("interface").empty()) interfaces.push_back(g.config.get("interface"));
-  if (!g.net.open(g.group, static_cast<uint16_t>(g.port), interfaces, error)) {
-    CloseHandle(instanceMutex);
-    return fail(L"Network setup failed: " + widen(error));
-  }
-
-  // This PC's key pair: the private half never leaves this PC (netmouse.key next to the settings).
-  crypto::Identity identity;
-  if (!crypto::loadOrCreateIdentity(fs::path(configPath).replace_extension(".key"), identity, error)) {
-    CloseHandle(instanceMutex);
-    return fail(L"Cannot load this PC's key: " + widen(error));
-  }
-  log::info("This PC's fingerprint: " + crypto::fingerprint(identity.publicKey));
-
-  if (g.role == "master") {
-    g.cursor.show();  // restore cursors in case a previous run crashed while they were hidden
-    MasterEngine::Options opt{g.id, g.name, g.config.getInt("hide_cursor", 1) != 0, identity};
-    g.master = std::make_unique<MasterEngine>(opt, g.config, g.net, g.displays, g.cursor);
-  } else {
-    g.injector = std::make_unique<WinInjector>(g.dryRun);
-    g.slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{g.id, g.name, identity}, g.config, g.net, g.displays,
-                                            *g.injector);
-  }
+  wchar_t appData[MAX_PATH];
+  const DWORD n = GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
+  g.prefsPath = (n > 0 && n < MAX_PATH ? fs::path(appData) : fs::current_path()) / L"NetMouse" / L"control.ini";
+  Config prefs;
+  prefs.load(g.prefsPath);
+  g.showTrayHint = prefs.getInt("tray_hint_shown", 0) == 0;
+  prefs.setInt("tray_hint_shown", 1);
+  prefs.save();
 
   loadIcons(instance);
   if (!createWindow(instance)) {
     CloseHandle(instanceMutex);
-    return fail(L"Could not create the main window.");
+    MessageBoxW(nullptr, L"Could not create the main window.", kAppTitle, MB_OK | MB_ICONERROR);
+    return 1;
   }
-  g.netThread = std::thread(networkLoop);
-  if (g.master && !g.hook.start(g.master.get())) {
-    g.running = false;
-    g.netThread.join();
-    CloseHandle(instanceMutex);
-    return fail(L"Could not install the mouse hook.");
-  }
-  if (g.show) showWindow();  // otherwise the app lives in the tray until the icon is clicked
+  g.poller = std::thread(pollLoop);
+  if (g.show) showWindow();
 
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
-
-  // Shutdown: stop capturing first so the cursor is guaranteed to be back on the master.
-  if (g.master) {
-    g.hook.stop();
-    g.master->onPanic();
-    g.cursor.show();
-  }
-  g.running = false;
-  g.netThread.join();
-  g.net.close();
-  log::info("Stopped");
-
-  if (g.restart) {
-    g.config.set("role", "");
-    g.config.save();
-    CloseHandle(instanceMutex);
-    instanceMutex = nullptr;
-    relaunch();
-  }
-  if (instanceMutex) CloseHandle(instanceMutex);
+  g.polling = false;
+  g.hwnd = nullptr;
+  g.poller.join();
+  CloseHandle(instanceMutex);
   if (g.font) DeleteObject(g.font);
   if (g.bigFont) DeleteObject(g.bigFont);
   return 0;
+}
+
+}  // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  enum class Mode { Control, Agent, Service, Quit } mode = Mode::Control;
+  win::AgentOptions agent;
+  for (int i = 1; i < argc; ++i) {
+    const std::wstring a = argv[i];
+    const bool hasValue = i + 1 < argc;
+    if (a == L"--service") {
+      mode = Mode::Service;
+    } else if (a == L"--agent") {
+      mode = Mode::Agent;
+    } else if (a == L"--quit") {
+      mode = Mode::Quit;
+    } else if (a == L"--show") {
+      g.show = true;
+    } else if (a == L"--dry-run") {
+      agent.dryRun = true;
+    } else if (a == L"--config" && hasValue) {
+      agent.config = argv[++i];
+    } else if (a == L"--pipe" && hasValue) {
+      agent.pipe = argv[++i];
+      g.pipe = agent.pipe;
+    } else if (a == L"--quit-event" && hasValue) {
+      agent.quitEvent = argv[++i];
+    } else if (a == L"--role" && hasValue) {
+      agent.role = narrow(argv[++i]);
+    }
+  }
+  LocalFree(argv);
+  switch (mode) {
+    case Mode::Service:
+      return win::runService();
+    case Mode::Agent:
+      return win::runAgent(agent);
+    case Mode::Quit:
+      return quitRunningInstances();
+    case Mode::Control:
+    default:
+      return runControlApp(instance);
+  }
 }

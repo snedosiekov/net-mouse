@@ -7,10 +7,12 @@
 #include <string>
 #include <vector>
 
+#include "app/control_handler.h"
 #include "app/master_engine.h"
 #include "app/slave_engine.h"
 #include "core/config.h"
 #include "core/crypto.h"
+#include "core/json.h"
 #include "core/keymap.h"
 #include "core/layout.h"
 #include "core/protocol.h"
@@ -279,6 +281,63 @@ void testInterfaceList() {
   CHECK(interfaceMatches(eth, "10.10.69.150"));
   CHECK(!interfaceMatches(eth, "Ethernet"));
   CHECK(!interfaceMatches(eth, "10.10.69.151"));
+}
+
+void testJson() {
+  auto v = json::parse(R"({"a":1.5,"b":[true,false,null],"s":"x\"y\\z\né","o":{"k":"v"},"n":-3})");
+  CHECK(v.has_value());
+  if (v) {
+    CHECK((*v)["a"].asNumber() == 1.5 && (*v)["n"].asInt() == -3);
+    CHECK((*v)["b"].size() == 3 && (*v)["b"][0].asBool() && !(*v)["b"][1].asBool(true) &&
+          (*v)["b"][2].type == json::Value::Type::Null);
+    CHECK((*v)["s"].asString() == "x\"y\\z\n\xC3\xA9");
+    CHECK((*v)["o"]["k"].asString() == "v" && (*v)["missing"]["deeper"].asString("d") == "d");
+  }
+  CHECK(!json::parse("{\"a\":}") && !json::parse("[1,2") && !json::parse("{} trailing"));
+  // Escaping round-trips.
+  const std::string tricky = "quote\" backslash\\ newline\n tab\t ctrl\x01";
+  auto back = json::parse("\"" + json::escape(tricky) + "\"");
+  CHECK(back && back->asString() == tricky);
+}
+
+// The control protocol (Linux socket / Windows pipe) on a connected master and slave.
+void testControlHandler() {
+  Rig r("control", {0, 0, 1920, 1080});
+  r.discover();
+  bool restarted = false;
+  ControlContext mc;
+  mc.role = "master";
+  mc.name = "master";
+  mc.id = 1;
+  mc.configPath = r.masterPath.string();
+  mc.master = r.master.get();
+  mc.requestRestart = [&] { restarted = true; };
+  auto status = json::parse(handleControlRequest(mc, "status", true));
+  CHECK(status && (*status)["role"].asString() == "master" && (*status)["slaves"].size() == 1);
+  const std::string slaveId = status ? (*status)["slaves"][0]["id"].asString() : "";
+  CHECK(status && !(*status)["slaves"][0]["paired"].asBool(true));
+
+  CHECK(handleControlRequest(mc, "pair " + slaveId, false).rfind("error permission denied", 0) == 0);
+  CHECK(handleControlRequest(mc, "pair " + slaveId, true) == "ok");
+  r.handshake();
+  status = json::parse(handleControlRequest(mc, "status", true));
+  CHECK(status && (*status)["slaves"][0]["connected"].asBool());
+  CHECK(handleControlRequest(mc, "set-offset " + slaveId + " 0 0", true).rfind("error", 0) == 0);  // overlap
+  CHECK(handleControlRequest(mc, "set-offset " + slaveId + " -1920 0", true) == "ok");
+  CHECK(handleControlRequest(mc, "forget-master", true).rfind("error", 0) == 0);  // master has none
+  CHECK(handleControlRequest(mc, "set-monitors 1x1+0+0", true).rfind("error", 0) == 0);  // not on this platform
+  CHECK(handleControlRequest(mc, "set-role slave", true) == "ok restarting" && restarted);
+  Config saved;
+  saved.load(r.masterPath);
+  CHECK(saved.get("role") == "slave");
+  CHECK(handleControlRequest(mc, "bogus", true).rfind("error unknown request", 0) == 0);
+
+  ControlContext sc;
+  sc.role = "slave";
+  sc.slave = r.slave.get();
+  status = json::parse(handleControlRequest(sc, "status", true));
+  CHECK(status && (*status)["paired"].asBool() && (*status)["master"]["fingerprint"].asString().size() == 19);
+  CHECK(handleControlRequest(sc, "forget-master", true) == "ok" && !r.slave->snapshot().paired);
 }
 
 void testKeymap() {
@@ -586,6 +645,8 @@ int main() {
   testConfig();
   testKeymap();
   testInterfaceList();
+  testJson();
+  testControlHandler();
   testPairing();
   testSession();
   testKeyboardSession();

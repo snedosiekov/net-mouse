@@ -3,7 +3,11 @@
 ; Build:  cmake --build build --config Release --target installer
 ;   or:   ISCC /DAppVersion=0.1.0 /DBinDir=..\build\Release installer\net-mouse.iss
 ;
-; Silent install: net-mouse-setup-<ver>.exe /VERYSILENT /ROLE=master|slave  (autostart is on; add /MERGETASKS="!autostart" to skip it)
+; Installs the NetMouse Windows service (does the work, also at the logon screen) and the control
+; app (tray icon, settings). Settings, key and logs: %ProgramData%\NetMouse.
+;
+; Silent install: net-mouse-setup-<ver>.exe /VERYSILENT /ROLE=master|slave
+;   autostart is on; add /MERGETASKS="!autostart" for a manually started service
 
 #ifndef AppVersion
   #define AppVersion "0.1.0"
@@ -41,7 +45,8 @@ CloseApplications=no
 
 [Tasks]
 ; Checked by default. Upgrades keep the previous choice; silent installs can opt out with /MERGETASKS="!autostart".
-Name: "autostart"; Description: "Start {#AppName} on Windows startup (when a user signs in)"; GroupDescription: "Startup:"
+; Unchecked: the service is set to start manually and the tray icon does not start at sign-in.
+Name: "autostart"; Description: "Start {#AppName} automatically with Windows"; GroupDescription: "Startup:"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
@@ -50,17 +55,17 @@ Source: "setup-helper.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "{code:DefaultRoleArgs}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Parameters: "{code:DefaultRoleArgs}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action prepare -Role ""{code:GetRole}"""; StatusMsg: "Preparing the settings..."; Flags: runhidden waituntilterminated
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action firewall -Exe ""{app}\{#AppExe}"""; StatusMsg: "Adding the firewall rule..."; Flags: runhidden waituntilterminated
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action autostart -Exe ""{app}\{#AppExe}"" -Role ""{code:GetRole}"""; StatusMsg: "Registering autostart..."; Tasks: autostart; Flags: runhidden waituntilterminated
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action remove-autostart"; Tasks: not autostart; Flags: runhidden waituntilterminated
-Filename: "{app}\{#AppExe}"; Parameters: "{code:DefaultRoleArgs}"; Description: "Start {#AppName} now"; Flags: nowait postinstall skipifsilent runasoriginaluser
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action service -Exe ""{app}\{#AppExe}"" -Autostart {code:AutostartFlag}"; StatusMsg: "Installing and starting the Net Mouse service..."; Flags: runhidden waituntilterminated
+Filename: "{app}\{#AppExe}"; Description: "Open the {#AppName} control app"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveFirewallAndTask"
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup-helper.ps1"" -Action uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveServiceAndFirewall"
 
 [Code]
 var
@@ -81,12 +86,12 @@ begin
   Result := RoleFromIndex(RolePage.SelectedValueIndex);
 end;
 
-function DefaultRoleArgs(Param: String): String;
+function AutostartFlag(Param: String): String;
 begin
-  if GetRole('') <> '' then
-    Result := '--default-role ' + GetRole('')
+  if WizardIsTaskSelected('autostart') then
+    Result := '1'
   else
-    Result := '';
+    Result := '0';
 end;
 
 procedure InitializeWizard;
@@ -100,7 +105,7 @@ begin
     True, False);
   RolePage.Add('Master: this PC''s mouse controls this PC and the slave PCs');
   RolePage.Add('Slave: this PC is controlled by the master PC''s mouse');
-  RolePage.Add('Ask on first start');
+  RolePage.Add('Keep the current role, or ask on first start');
 
   Role := Lowercase(ExpandConstant('{param:ROLE|}'));
   if Role = '' then
@@ -118,12 +123,14 @@ begin
   SetPreviousData(PreviousDataKey, 'Role', GetRole(''));
 end;
 
-// Asks running instances to exit cleanly (restoring the cursor), then kills any left over,
-// e.g. instances in other sessions.
+// Stops the service (its agent restores the cursor and exits), asks control apps and older per-user
+// versions to close cleanly, then ends anything left over (e.g. in other sessions).
 procedure StopRunningInstances(Exe: String);
 var
   ResultCode: Integer;
 begin
+  Exec('powershell.exe', '-NoProfile -Command "Stop-Service -Name NetMouse -Force -ErrorAction SilentlyContinue"', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if FileExists(Exe) then
   begin
     Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);

@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 
+#include "app/control_handler.h"
 #include "app/master_engine.h"
 #include "app/network_loop.h"
 #include "app/slave_engine.h"
@@ -119,87 +120,6 @@ int listDevices(LinuxDisplays& displays) {
   return 0;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Control requests
-
-std::string pointJson(Point p) { return log::fmt("{\"x\":%d,\"y\":%d}", p.x, p.y); }
-
-std::string rectJson(const Rect& r) {
-  return log::fmt("{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d}", r.left, r.top, r.width(), r.height());
-}
-
-std::string monitorsJson(const std::vector<MonitorInfo>& monitors) {
-  std::string out = "[";
-  for (size_t i = 0; i < monitors.size(); ++i) {
-    const MonitorInfo& m = monitors[i];
-    if (i) out += ",";
-    out += log::fmt("{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"primary\":%s,\"name\":\"%s\"}", m.rect.left, m.rect.top,
-                    m.rect.width(), m.rect.height(), m.primary ? "true" : "false", jsonEscape(m.name).c_str());
-  }
-  return out + "]";
-}
-
-struct DaemonState {
-  std::string role;
-  std::string name;
-  uint64_t id = 0;
-  std::string configPath;
-  std::string monitorSpec;
-  MasterEngine* master = nullptr;
-  SlaveEngine* slave = nullptr;
-  UdpMulticast* net = nullptr;
-};
-
-std::string interfacesJson(const UdpMulticast& net) {
-  std::string out = "[";
-  for (const UdpMulticast::Choice& c : net.choices()) {
-    if (out.size() > 1) out += ",";
-    out += log::fmt("{\"name\":\"%s\",\"ip\":\"%s\",\"up\":%s,\"selected\":%s}", jsonEscape(c.iface.name).c_str(),
-                    c.iface.addr ? ipToString(c.iface.addr).c_str() : "", c.iface.addr ? "true" : "false",
-                    c.selected ? "true" : "false");
-  }
-  return out + "]";
-}
-
-std::string statusJson(const DaemonState& st) {
-  std::string out = log::fmt(
-      "{\"role\":\"%s\",\"name\":\"%s\",\"id\":\"%s\",\"config\":\"%s\",\"monitor_spec\":\"%s\","
-      "\"interface_filter\":\"%s\",\"interfaces\":%s,",
-      st.role.c_str(), jsonEscape(st.name).c_str(), toHex(st.id).c_str(), jsonEscape(st.configPath).c_str(),
-      jsonEscape(st.monitorSpec).c_str(), jsonEscape(joinInterfaceList(st.net->filter())).c_str(),
-      interfacesJson(*st.net).c_str());
-  if (st.master) {
-    const MasterSnapshot s = st.master->snapshot();
-    out += log::fmt("\"fingerprint\":\"%s\",\"remote\":%s,\"active\":\"%s\",\"pointer\":%s,\"monitors\":%s,\"slaves\":[",
-                    s.fingerprint.c_str(), s.remote ? "true" : "false", s.remote ? toHex(s.activeSlave).c_str() : "",
-                    pointJson(s.virtualPos).c_str(), monitorsJson(s.masterMonitors).c_str());
-    auto b = [](bool v) { return v ? "true" : "false"; };
-    for (size_t i = 0; i < s.slaves.size(); ++i) {
-      const SlaveView& v = s.slaves[i];
-      if (i) out += ",";
-      out += log::fmt(
-          "{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"online\":%s,\"paired\":%s,\"connected\":%s,"
-          "\"synced\":%s,\"key_mismatch\":%s,\"other_master\":%s,\"fingerprint\":\"%s\",\"offset\":%s,\"monitors\":[",
-          toHex(v.id).c_str(), jsonEscape(v.name).c_str(), ipToString(v.ip).c_str(), b(v.online), b(v.paired),
-          b(v.connected), b(v.synced), b(v.keyMismatch), b(v.otherMaster), v.fingerprint.c_str(),
-          pointJson(v.offset).c_str());
-      for (size_t k = 0; k < v.monitors.size(); ++k) out += (k ? "," : "") + rectJson(v.monitors[k]);
-      out += "]}";
-    }
-    out += "]}";
-  } else {
-    const SlaveSnapshot s = st.slave->snapshot();
-    auto b = [](bool v) { return v ? "true" : "false"; };
-    out += log::fmt(
-        "\"fingerprint\":\"%s\",\"paired\":%s,\"connected\":%s,\"configured\":%s,\"active\":%s,\"offset\":%s,"
-        "\"monitors\":%s,\"master\":{\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"online\":%s,\"fingerprint\":\"%s\"}}",
-        s.fingerprint.c_str(), b(s.paired), b(s.connected), b(s.configured), b(s.active), pointJson(s.offset).c_str(),
-        monitorsJson(s.monitors).c_str(), toHex(s.masterId).c_str(), jsonEscape(s.masterName).c_str(),
-        s.masterIp ? ipToString(s.masterIp).c_str() : "", b(s.masterOnline), s.masterFingerprint.c_str());
-  }
-  return out;
-}
-
 // Role and monitor changes are written to the settings and applied by restarting: the daemon exits
 // and systemd (Restart=always) starts it again with the new settings.
 void requestRestart() {
@@ -207,97 +127,6 @@ void requestRestart() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     kill(getpid(), SIGUSR1);
   }).detach();
-}
-
-std::string saveSetting(const std::string& configPath, const std::string& key, const std::string& value) {
-  Config fresh;
-  fresh.load(configPath);
-  if (value.empty()) {
-    fresh.erase(key);
-  } else {
-    fresh.set(key, value);
-  }
-  if (!fresh.save()) return "error cannot write " + configPath;
-  requestRestart();
-  return "ok restarting";
-}
-
-std::string handleRequest(const DaemonState& st, const std::string& request, bool privileged) {
-  std::istringstream in(request);
-  std::string cmd;
-  in >> cmd;
-  if (cmd == "status") return statusJson(st);
-  if (cmd != "status" && !privileged) {
-    return "error permission denied: needs root or membership in sudo/wheel/admin/netmouse";
-  }
-  if (cmd == "pair" || cmd == "unpair") {
-    std::string id;
-    if (!st.master) return "error only a master connects PCs";
-    if (!(in >> id)) return "error usage: " + cmd + " SLAVE_ID";
-    uint64_t slaveId = 0;
-    try {
-      slaveId = std::stoull(id, nullptr, 16);
-    } catch (...) {
-      return "error bad slave id";
-    }
-    if (cmd == "pair") {
-      return st.master->pairSlave(slaveId) ? "ok"
-                                           : "error that PC is not available (offline, or paired with another master)";
-    }
-    return st.master->unpairSlave(slaveId) ? "ok" : "error that PC is not connected";
-  }
-  if (cmd == "set-interfaces") {
-    // "all" or a comma-separated list of interface names/addresses; applied immediately.
-    std::string rest;
-    std::getline(in, rest);
-    std::vector<std::string> list = parseInterfaceList(rest);
-    if (list.size() == 1 && list[0] == "all") list.clear();
-    if (list.empty() && rest.find_first_not_of(" \t") == std::string::npos) {
-      return "error usage: set-interfaces all|NAME[,NAME...]";
-    }
-    Config fresh;
-    fresh.load(st.configPath);
-    fresh.set("interfaces", joinInterfaceList(list));
-    fresh.erase("interface");
-    if (!fresh.save()) return "error cannot write " + st.configPath;
-    st.net->setFilter(list);
-    return "ok";
-  }
-  if (cmd == "forget-master") {
-    if (!st.slave) return "error only a slave has a master to forget";
-    st.slave->forgetMaster();
-    return "ok";
-  }
-  if (cmd == "set-offset") {
-    std::string id;
-    int x = 0, y = 0;
-    if (!st.master) return "error only a master arranges slaves";
-    if (!(in >> id >> x >> y)) return "error usage: set-offset SLAVE_ID X Y";
-    uint64_t slaveId = 0;
-    try {
-      slaveId = std::stoull(id, nullptr, 16);
-    } catch (...) {
-      return "error bad slave id";
-    }
-    return st.master->setSlaveOffset(slaveId, {x, y}) ? "ok" : "error that position overlaps another screen";
-  }
-  if (cmd == "set-role") {
-    std::string role;
-    in >> role;
-    if (role != "master" && role != "slave") return "error usage: set-role master|slave";
-    log::info("Role changed to " + role + " via the control socket");
-    return saveSetting(st.configPath, "role", role);
-  }
-  if (cmd == "set-monitors") {
-    std::string spec;
-    in >> spec;
-    if (spec == "auto") spec.clear();
-    if (!spec.empty() && parseMonitorSpec(spec).empty()) return "error bad monitor layout (expected WxH+X+Y,...)";
-    log::info("Monitor layout changed to '" + (spec.empty() ? std::string("auto") : spec) + "' via the control socket");
-    return saveSetting(st.configPath, "monitors", spec);
-  }
-  return "error unknown request '" + cmd +
-         "' (status, pair, unpair, set-offset, forget-master, set-role, set-monitors, set-interfaces)";
 }
 
 }  // namespace
@@ -414,10 +243,22 @@ int main(int argc, char** argv) {
     slave = std::make_unique<SlaveEngine>(SlaveEngine::Options{id, name, identity}, config, net, displays, *injector);
   }
 
-  DaemonState state{role, name, id, args.config, monitorSpec, master.get(), slave.get(), &net};
+  ControlContext state;
+  state.role = role;
+  state.name = name;
+  state.id = id;
+  state.configPath = args.config;
+  state.group = group;
+  state.port = port;
+  state.monitorSpec = monitorSpec;
+  state.master = master.get();
+  state.slave = slave.get();
+  state.net = &net;
+  state.requestRestart = requestRestart;
+  state.validMonitorSpec = [](const std::string& spec) { return !parseMonitorSpec(spec).empty(); };
   ControlServer control;
   if (!control.start(
-          args.control, [&state](const std::string& req, bool privileged) { return handleRequest(state, req, privileged); },
+          args.control, [&state](const std::string& req, bool privileged) { return handleControlRequest(state, req, privileged); },
           error)) {
     log::info("Warning: " + error + " (the GUI and net-mouse-ctl status will not work)");
   }

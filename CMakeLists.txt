@@ -30,6 +30,8 @@ add_library(nm_core STATIC
   src/app/master_engine.cpp
   src/app/slave_engine.cpp
   src/app/network_loop.cpp
+  src/app/control_handler.cpp
+  src/core/json.cpp
 )
 target_include_directories(nm_core PUBLIC src PRIVATE third_party/monocypher)
 # Third-party code: compiled as is, without our warning flags.
@@ -76,12 +78,15 @@ if(WIN32)
   configure_file(src/ui/win/resources.rc.in ${CMAKE_CURRENT_BINARY_DIR}/resources.rc @ONLY)
   add_executable(net-mouse WIN32
     src/platform/win/win_platform.cpp
+    src/platform/win/win_common.cpp
+    src/win/agent_win.cpp
+    src/win/service_win.cpp
     src/ui/win/layout_view.cpp
     src/ui/win/network_dialog.cpp
     src/ui/win/app_win.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/resources.rc
   )
-  target_link_libraries(net-mouse PRIVATE nm_core comctl32 shell32 user32 gdi32 gdiplus)
+  target_link_libraries(net-mouse PRIVATE nm_core comctl32 shell32 user32 gdi32 gdiplus advapi32 wtsapi32 ole32)
 
   # Installer: cmake --build build --config Release --target installer
   find_program(ISCC_EXECUTABLE ISCC

@@ -73,24 +73,84 @@ std::vector<MonitorInfo> WinDisplays::monitors() {
 
 // ---------------------------------------------------------------------------------------------
 
-void WinCursor::setPos(Point p) { SetCursorPos(p.x, p.y); }
+std::wstring desktopName(HDESK desk) {
+  wchar_t name[256] = {};
+  DWORD needed = 0;
+  return GetUserObjectInformationW(desk, UOI_NAME, name, sizeof(name), &needed) ? std::wstring(name) : std::wstring();
+}
+
+std::wstring inputDesktopName() {
+  HDESK desk = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+  if (!desk) return {};
+  std::wstring name = desktopName(desk);
+  CloseDesktop(desk);
+  return name;
+}
+
+bool attachToInputDesktop() {
+  thread_local HDESK attached = nullptr;
+  HDESK desk = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+  if (!desk) return false;
+  if (desktopName(desk) == desktopName(GetThreadDesktop(GetCurrentThreadId()))) {
+    CloseDesktop(desk);
+    return true;
+  }
+  if (!SetThreadDesktop(desk)) {
+    CloseDesktop(desk);
+    return false;
+  }
+  if (attached) CloseDesktop(attached);
+  attached = desk;
+  return true;
+}
+
+void syncInputDesktop() {
+  thread_local ULONGLONG lastCheck = 0;
+  const ULONGLONG now = GetTickCount64();
+  if (now - lastCheck < 250) return;
+  lastCheck = now;
+  attachToInputDesktop();
+}
+
+namespace {
+constexpr DWORD kCursorIds[] = {OCR_NORMAL,   OCR_IBEAM,    OCR_WAIT,   OCR_CROSS,  OCR_UP,
+                                OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS, OCR_SIZEALL,
+                                OCR_NO,       OCR_HAND,     OCR_APPSTARTING, 32651 /* OCR_HELP */};
+}  // namespace
+
+void WinCursor::setPos(Point p) {
+  syncInputDesktop();
+  SetCursorPos(p.x, p.y);
+}
 
 void WinCursor::hide() {
-  static const DWORD kIds[] = {OCR_NORMAL, OCR_IBEAM,  OCR_WAIT,   OCR_CROSS,  OCR_UP,
-                               OCR_SIZENWSE, OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS, OCR_SIZEALL,
-                               OCR_NO,     OCR_HAND,   OCR_APPSTARTING, 32651 /* OCR_HELP */};
+  if (!saved_.empty()) return;
   const int w = GetSystemMetrics(SM_CXCURSOR);
   const int h = GetSystemMetrics(SM_CYCURSOR);
   std::vector<BYTE> andMask(static_cast<size_t>(w * h / 8), 0xFF);
   std::vector<BYTE> xorMask(static_cast<size_t>(w * h / 8), 0x00);
-  for (DWORD id : kIds) {
+  for (DWORD id : kCursorIds) {
+    // Keep a copy of the user's current cursor: as SYSTEM, reloading the scheme from the registry
+    // would bring back the default cursors instead of theirs.
+    HCURSOR current = static_cast<HCURSOR>(LoadImageW(nullptr, MAKEINTRESOURCEW(id), IMAGE_CURSOR, 0, 0,
+                                                      LR_SHARED | LR_DEFAULTSIZE));
+    saved_.push_back({id, current ? CopyCursor(current) : nullptr});
     // SetSystemCursor takes ownership, so every id needs its own copy.
     HCURSOR blank = CreateCursor(GetModuleHandleW(nullptr), 0, 0, w, h, andMask.data(), xorMask.data());
     if (blank) SetSystemCursor(blank, id);
   }
 }
 
-void WinCursor::show() { SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0); }
+void WinCursor::show() {
+  if (saved_.empty()) {
+    SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0);
+    return;
+  }
+  for (const auto& [id, cursor] : saved_) {
+    if (cursor) SetSystemCursor(cursor, id);  // takes ownership of the copy
+  }
+  saved_.clear();
+}
 
 uint8_t WinCursor::pressedButtons() {
   uint8_t mask = 0;
@@ -109,6 +169,7 @@ void WinInjector::moveTo(Point p) {
     log::info(std::format("[dry-run] move to ({}, {})", p.x, p.y));
     return;
   }
+  syncInputDesktop();  // also reaches the lock/logon screen and UAC prompts
   const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
   const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
   const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -122,6 +183,7 @@ void WinInjector::button(uint8_t button, bool down) {
     log::info(std::format("[dry-run] button {} {}", button, down ? "down" : "up"));
     return;
   }
+  syncInputDesktop();
   switch (button) {
     case proto::kButtonLeft:
       sendMouse(down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP, 0, 0, 0);
@@ -148,6 +210,7 @@ void WinInjector::wheel(int delta, bool horizontal) {
     log::info(std::format("[dry-run] {} wheel {}", horizontal ? "horizontal" : "vertical", delta));
     return;
   }
+  syncInputDesktop();
   sendMouse(horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL, 0, 0, static_cast<DWORD>(delta));
 }
 
@@ -158,6 +221,7 @@ void WinInjector::key(uint16_t code, int value) {
   }
   keymap::WinKey wk;
   if (!keymap::toWindows(code, wk)) return;  // no Windows equivalent
+  syncInputDesktop();
   INPUT in{};
   in.type = INPUT_KEYBOARD;
   if (wk.vk) {
@@ -192,6 +256,12 @@ void WinInputHook::run(void* readyPtr) {
   auto* ready = static_cast<std::promise<bool>*>(readyPtr);
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
   threadId_ = GetCurrentThreadId();
+  // Low-level hooks only see input on their thread's desktop.
+  attachToInputDesktop();
+  {
+    std::lock_guard lock(desktopMutex_);
+    desktop_ = desktopName(GetThreadDesktop(threadId_));
+  }
   MSG msg;
   PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // creates the message queue
   mouseHook_ = SetWindowsHookExW(WH_MOUSE_LL, &WinInputHook::mouseProc, GetModuleHandleW(nullptr), 0);
@@ -215,6 +285,11 @@ void WinInputHook::run(void* readyPtr) {
   UnhookWindowsHookEx(mouseHook_);
   UnhookWindowsHookEx(keyboardHook_);
   mouseHook_ = keyboardHook_ = nullptr;
+}
+
+std::wstring WinInputHook::desktop() const {
+  std::lock_guard lock(desktopMutex_);
+  return thread_.joinable() ? desktop_ : std::wstring();
 }
 
 void WinInputHook::stop() {
