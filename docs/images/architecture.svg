@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 470" width="940" height="470" role="img"
+     aria-label="A Windows service starts an agent in the signed-in session; agents talk to each other over encrypted UDP, the control app only shows and changes settings">
+  <defs>
+    <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4A5567"/>
+    </marker>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2654A8"/>
+    </marker>
+  </defs>
+
+  <rect width="940" height="470" fill="#ffffff"/>
+
+  <!-- MASTER -->
+  <rect x="18" y="52" width="384" height="330" rx="14" fill="#F4F8FF" stroke="#C7D8F1"/>
+  <text x="34" y="78" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="14" font-weight="700"
+        fill="#2654A8">MASTER PC</text>
+  <rect x="36" y="92" width="348" height="42" rx="9" fill="#ffffff" stroke="#C7D8F1"/>
+  <text x="50" y="110" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="12.5" font-weight="600"
+        fill="#2E3542">NetMouse service</text>
+  <text x="50" y="126" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    LocalSystem, starts with Windows — supervises the agent</text>
+  <path d="M210,134 L210,154" stroke="#4A5567" stroke-width="1.6" marker-end="url(#a1)" fill="none"/>
+
+  <rect x="36" y="156" width="348" height="104" rx="9" fill="#ffffff" stroke="#C7D8F1"/>
+  <text x="50" y="176" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="12.5" font-weight="600"
+        fill="#2E3542">Agent — SYSTEM, follows the input desktop</text>
+  <text x="50" y="196" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • captures the mouse and keyboard (low-level hooks)</text>
+  <text x="50" y="214" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • owns the layout and decides the edge crossings</text>
+  <text x="50" y="232" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • swallows the input while the pointer is on a slave</text>
+  <text x="50" y="250" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • seals every message for one slave</text>
+
+  <path d="M210,260 L210,292" stroke="#4A5567" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#a1)" fill="none"/>
+  <text x="222" y="280" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11" fill="#5A6472">local control pipe</text>
+
+  <rect x="36" y="294" width="348" height="70" rx="9" fill="#ffffff" stroke="#C7D8F1"/>
+  <text x="50" y="314" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="12.5" font-weight="600"
+        fill="#2E3542">Control app — tray icon, arrangement window</text>
+  <text x="50" y="334" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    Shows what the agent reports and sends it commands.</text>
+  <text x="50" y="352" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    Closing it does not stop the sharing.</text>
+
+  <!-- SLAVE -->
+  <rect x="538" y="52" width="384" height="330" rx="14" fill="#F3FBF7" stroke="#BEE4D3"/>
+  <text x="554" y="78" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="14" font-weight="700"
+        fill="#1A7C54">SLAVE PC</text>
+
+  <rect x="556" y="92" width="348" height="42" rx="9" fill="#ffffff" stroke="#BEE4D3"/>
+  <text x="570" y="110" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="12.5" font-weight="600"
+        fill="#2E3542">NetMouse service (systemd unit on Linux)</text>
+  <text x="570" y="126" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    starts with the PC — no sign-in needed</text>
+  <path d="M730,134 L730,154" stroke="#4A5567" stroke-width="1.6" marker-end="url(#a1)" fill="none"/>
+
+  <rect x="556" y="156" width="348" height="104" rx="9" fill="#ffffff" stroke="#BEE4D3"/>
+  <text x="570" y="176" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="12.5" font-weight="600"
+        fill="#2E3542">Agent — SYSTEM, follows the input desktop</text>
+  <text x="570" y="196" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • opens and checks every message from its master</text>
+  <text x="570" y="214" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • converts layout → local screen coordinates</text>
+  <text x="570" y="232" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • injects mouse and keys: SendInput, uinput on Linux</text>
+  <text x="570" y="250" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    • releases everything if the stream stops</text>
+
+  <path d="M730,260 L730,292" stroke="#4A5567" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#a1)" fill="none"/>
+  <text x="742" y="280" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11" fill="#5A6472">local control pipe</text>
+
+  <rect x="556" y="294" width="348" height="70" rx="9" fill="#ffffff" stroke="#BEE4D3"/>
+  <text x="570" y="314" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="12.5" font-weight="600"
+        fill="#2E3542">Control app — or net-mouse-ctl on Linux</text>
+  <text x="570" y="334" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    Shows this PC's fingerprint, so you can check it</text>
+  <text x="570" y="352" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5" fill="#5A6472">
+    when connecting it on the master.</text>
+
+  <!-- the link -->
+  <path d="M404,186 L534,186" stroke="#2654A8" stroke-width="2.6" marker-end="url(#a2)" fill="none"/>
+  <path d="M534,238 L404,238" stroke="#2654A8" stroke-width="1.8" stroke-dasharray="6 5" marker-end="url(#a2)" fill="none"/>
+  <text x="469" y="150" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11.5"
+        font-weight="600" fill="#2654A8">UDP 47800</text>
+  <text x="469" y="168" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11"
+        fill="#2654A8">pointer + keys,</text>
+  <text x="469" y="182" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11"
+        fill="#2654A8">sealed</text>
+  <text x="469" y="266" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11"
+        fill="#2654A8">hello: name,</text>
+  <text x="469" y="280" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="11"
+        fill="#2654A8">screens, session</text>
+
+  <!-- padlock -->
+  <g transform="translate(458 196)">
+    <rect x="0" y="9" width="24" height="18" rx="4" fill="#2654A8"/>
+    <path d="M5,9 V6 a7,7 0 0 1 14,0 V9" fill="none" stroke="#2654A8" stroke-width="2.6"/>
+    <circle cx="12" cy="18" r="2.6" fill="#ffffff"/>
+  </g>
+
+  <text x="20" y="412" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="13.5" fill="#5A6472">
+    The agent runs as SYSTEM and follows the input desktop, so a slave can also be used at its lock and logon screens and in UAC prompts.</text>
+  <text x="20" y="434" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="13.5" fill="#5A6472">
+    A master stops capturing while its own screen is locked, so nobody can reach the other PCs from a locked master.</text>
+  <text x="20" y="456" font-family="Segoe UI, Inter, system-ui, sans-serif" font-size="13.5" fill="#5A6472">
+    Keys are paired once, with fingerprints shown on both PCs; after that every control message is encrypted and authenticated.</text>
+</svg>

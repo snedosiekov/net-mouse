@@ -5,6 +5,12 @@ Use the mouse and keyboard of one PC (the **master**) to control that PC and any
 way as in the Windows display settings. When the pointer leaves the master's monitors through an edge that
 touches a slave screen, it continues on that slave, and the keyboard follows it.
 
+![One mouse and keyboard; the pointer crosses from the master's screen onto the other PCs](docs/images/overview.svg)
+
+It is a software KVM for input only: no video, no files, nothing installed on the PCs but Net Mouse
+itself. Each PC keeps its own screens, applications and clipboard; only the pointer and the keystrokes
+travel over the network.
+
 * **Zero setup on the slaves:** they find the master by UDP multicast; the master places them and sends
   each its position.
 * **Pairing on the master** with key fingerprints; all control traffic is **encrypted and authenticated**
@@ -84,6 +90,11 @@ Startup is enabled by default; add `/MERGETASKS="!autostart"` for a manually sta
 
 ## Usage
 
+![The arrangement window on the master, with two connected PCs and one waiting](docs/images/control-master.png)
+
+*The master's window: its own monitors in blue, connected PCs in green, an orange glow around the PC
+that has the pointer right now, and PCs that were found but are not connected yet on the strip below.*
+
 1. Install Net Mouse on every PC and choose the role: **Master** on the PC whose mouse you use, **Slave**
    on the others (in the installer, or on first start of the control app). Change it later from the
    tray menu (*Change role…*).
@@ -106,6 +117,17 @@ Startup is enabled by default; add `/MERGETASKS="!autostart"` for a manually sta
    master's clicks, wheel and **keyboard** go to that slave. Keys are sent as physical key positions,
    so the slave's own keyboard layout applies. A key's release always goes where its press went, so
    nothing sticks when the pointer moves between PCs. Ctrl+Alt+Del and Win+L stay on the master.
+
+Everything else is in the tray menu, and *Network…* picks the networks Net Mouse may use — leave out
+tunnels and VPNs that the other PCs should not be reached through:
+
+![The tray menu](docs/images/tray-menu.png)
+![Choosing the network interfaces](docs/images/network-dialog.png)
+
+A slave needs no attention of its own; its window only reports what is going on, and shows the
+fingerprint to check while connecting it on the master:
+
+![A slave's window](docs/images/control-slave.png)
 
 **Emergency return:** **Ctrl+Alt+Home** or the tray item *Return pointer to this PC* brings the pointer
 back to the master at once. A slave that disappears from the network also returns the pointer
@@ -147,17 +169,14 @@ next to it; it never leaves the PC. Logs: `netmouse-agent.log` and `netmouse-ser
 
 ## How it works
 
-```
- MASTER                                                      SLAVE
- WH_MOUSE_LL /          MasterEngine      encrypted UDP      SlaveEngine          SendInput
- WH_KEYBOARD_LL ──────► (layout space, ───── to slave ─────► (layout -> local, ──► (mouse, keys)
- (swallow input          edge crossing,                       button/key
-  while remote)          key routing)                         reconciliation)
-```
+![The service starts an agent in the signed-in session; the agents talk over encrypted UDP](docs/images/architecture.svg)
 
 * **Layout space** = the master's virtual-desktop coordinates in physical pixels. Every slave's monitors
   are placed in it at an *offset* chosen in the arrangement dialog. The slave receives that offset and
   converts with `local = layout_position − offset`.
+
+  ![All screens form one layout space; each slave is placed in it at an offset](docs/images/layout.svg)
+
 * **Capture (master):** a low-level mouse hook watches the cursor. When it touches an edge pixel and
   the neighbouring layout pixel belongs to a slave, the master switches to *remote* mode. The real cursor
   is parked at the centre of the primary monitor and hidden. Each hooked move is converted into a
