@@ -1,0 +1,136 @@
+name: Release
+
+# Push a version tag to publish a release:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The workflow builds net-mouse.exe with that version stamped in, runs the tests, builds the Inno
+# Setup installer and publishes a GitHub release with the installer, a portable zip and the SHA-256
+# checksums. Running it by hand (Actions → Release → Run workflow) only builds the files and keeps
+# them as an artifact, without publishing anything.
+#
+# Linux is installed from source (see README), so there is nothing to attach for it here.
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, like 0.2.0 (default: the version in CMakeLists.txt)'
+        required: false
+        type: string
+
+permissions:
+  contents: write  # needed to create the release
+
+jobs:
+  windows:
+    name: Installer (Windows)
+    runs-on: windows-latest
+    # Job level, so the signing steps can test for the certificate in their "if".
+    env:
+      CERT: ${{ secrets.WINDOWS_CERT_BASE64 }}
+      CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: ver
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ('${{ github.ref_type }}' -eq 'tag') {
+            $version = $tag -replace '^v', ''
+          } elseif ($env:INPUT_VERSION) {
+            $version = $env:INPUT_VERSION.Trim()
+          } else {
+            $version = (Select-String -Path CMakeLists.txt -Pattern 'project\(net-mouse VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "'$version' is not a version like 1.2.3" }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "Building version $version"
+
+      - name: Install Inno Setup if the image does not have it
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem -ErrorAction SilentlyContinue `
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          if (-not $iscc) { choco install innosetup --no-progress -y }
+
+      - name: Configure
+        # The -D argument stays quoted: PowerShell otherwise cuts "...=0.2.0" down to "0".
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DNETMOUSE_VERSION=${{ steps.ver.outputs.version }}"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # Signing is optional: without the two secrets the files go out unsigned, and Windows
+      # SmartScreen warns about them until the publisher builds a reputation.
+      - name: Sign net-mouse.exe
+        if: ${{ env.CERT != '' }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:CERT))
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Select-Object -Last 1).FullName
+          & $signtool sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:CERT_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 build\Release\net-mouse.exe
+          Remove-Item "$env:RUNNER_TEMP\cert.pfx"
+
+      - name: Installer
+        run: cmake --build build --config Release --target installer
+
+      - name: Sign the installer
+        if: ${{ env.CERT != '' }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:CERT))
+          $signtool = (Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' | Select-Object -Last 1).FullName
+          & $signtool sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:CERT_PASSWORD /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 "build\installer\net-mouse-setup-${{ steps.ver.outputs.version }}.exe"
+          Remove-Item "$env:RUNNER_TEMP\cert.pfx"
+
+      - name: Collect the files to publish
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "build\installer\net-mouse-setup-$env:VERSION.exe" dist\
+          # Portable: the same single executable, for trying it without installing. It can run the
+          # agent by hand, but only the installer sets up the service and the firewall rule.
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item build\Release\net-mouse.exe, README.md portable\
+          Compress-Archive -Path portable\* -DestinationPath "dist\net-mouse-$env:VERSION-win64-portable.zip" -Force
+          # Named files, not dist\*: the checksum file must not try to hash itself while it is written.
+          Get-FileHash -Algorithm SHA256 `
+              "dist\net-mouse-setup-$env:VERSION.exe", "dist\net-mouse-$env:VERSION-win64-portable.zip" |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Get-ChildItem dist | Select-Object Name, Length
+          Get-Content dist\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: net-mouse-${{ steps.ver.outputs.version }}-windows
+          path: dist/*
+
+      # Only a tag publishes. Add --draft here to review each release before it goes public.
+      - name: Publish the release
+        if: ${{ github.ref_type == 'tag' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "${{ github.ref_name }}" `
+            --title "Net Mouse $env:VERSION" `
+            --generate-notes `
+            "dist\net-mouse-setup-$env:VERSION.exe" `
+            "dist\net-mouse-$env:VERSION-win64-portable.zip" `
+            "dist\SHA256SUMS.txt"

@@ -1,6 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
 project(net-mouse VERSION 0.1.0 LANGUAGES C CXX)
 
+# Version stamped into the executable and the installer. A release build passes the tag:
+#   cmake -S . -B build -DNETMOUSE_VERSION=1.2.3
+set(NETMOUSE_VERSION "${PROJECT_VERSION}" CACHE STRING "Version of the binaries and the installer")
+if(NOT NETMOUSE_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+  message(FATAL_ERROR "NETMOUSE_VERSION must look like 1.2.3, but is '${NETMOUSE_VERSION}'")
+endif()
+set(NETMOUSE_VERSION_MAJOR ${CMAKE_MATCH_1})
+set(NETMOUSE_VERSION_MINOR ${CMAKE_MATCH_2})
+set(NETMOUSE_VERSION_PATCH ${CMAKE_MATCH_3})
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -95,7 +105,7 @@ if(WIN32)
   if(ISCC_EXECUTABLE)
     add_custom_target(installer
       COMMAND "${ISCC_EXECUTABLE}" /Q
-              "/DAppVersion=${PROJECT_VERSION}"
+              "/DAppVersion=${NETMOUSE_VERSION}"
               "/DBinDir=$<TARGET_FILE_DIR:net-mouse>"
               "/O${CMAKE_BINARY_DIR}/installer"
               "${CMAKE_SOURCE_DIR}/installer/net-mouse.iss"

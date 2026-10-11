@@ -64,6 +64,32 @@ net-mouse-setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /ROLE=slave
 
 Startup is enabled by default; add `/MERGETASKS="!autostart"` for a manually started service.
 
+### Releases and CI
+
+Ready-made installers come from GitHub Actions; nothing has to be built by hand to install Net Mouse.
+
+* **[Build](.github/workflows/build.yml)** runs on every push and pull request: builds and tests on
+  Windows and Linux, and builds the installer, which is kept as a build artifact for 14 days.
+* **[Release](.github/workflows/release.yml)** runs on a version tag and publishes a GitHub release:
+
+  ```
+  git tag v0.2.0
+  git push origin v0.2.0
+  ```
+
+  The tag sets the version of `net-mouse.exe` and of the setup, so the three stay in step. The release
+  gets `net-mouse-setup-<version>.exe`, a portable zip of the bare executable and `SHA256SUMS.txt`.
+  Running the workflow by hand only builds those files and attaches them to the run.
+
+Local builds keep the version from `project(net-mouse VERSION …)` in
+[CMakeLists.txt](CMakeLists.txt); `-DNETMOUSE_VERSION=1.2.3` overrides it, which is what the release
+workflow does with the tag.
+
+The published files are **not code-signed**, so Windows SmartScreen warns the first time one is run
+("More info" → "Run anyway"). With a code-signing certificate, put the `.pfx` base64-encoded in the
+repository secret `WINDOWS_CERT_BASE64` and its password in `WINDOWS_CERT_PASSWORD`, and the release
+workflow signs both files; without those secrets it simply skips signing.
+
 ### Windows: service, agent and control app
 
 ```

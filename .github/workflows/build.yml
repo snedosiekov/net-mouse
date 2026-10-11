@@ -1,0 +1,62 @@
+name: Build
+
+# Every push and pull request: build and test both platforms, and build the Windows installer so a
+# broken Inno Setup script is caught here and not only at release time. The installer of each run is
+# kept as a build artifact for 14 days (Actions → the run → Artifacts); released versions come from
+# release.yml instead.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Inno Setup if the image does not have it
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem -ErrorAction SilentlyContinue `
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          if (-not $iscc) { choco install innosetup --no-progress -y }
+
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Installer
+        run: cmake --build build --config Release --target installer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: net-mouse-setup-unreleased
+          path: build/installer/*.exe
+          retention-days: 14
+
+  linux:
+    name: Linux (GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

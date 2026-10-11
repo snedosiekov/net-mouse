@@ -5,3 +5,5 @@ out/
 *.user
 __pycache__/
 *.pyc
+dist/
+portable/
