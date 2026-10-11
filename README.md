@@ -396,3 +396,19 @@ Prototype limitations:
 * **Linux, next steps:** a tray icon; reading the monitor layout from Wayland (`wl_output` /
   `xdg-output`) automatically; touchpad support on the master; .deb/.rpm packages.
 * Clipboard sharing; key rotation for long-running sessions.
+
+## License
+
+Copyright (C) 2026 Serhii Nedosiekov
+
+Net Mouse is free software: you can redistribute it and/or modify it under the terms of the **GNU
+General Public License** as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version. The full text is in [LICENSE](LICENSE).
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+General Public License for more details.
+
+[third_party/monocypher](third_party/monocypher) is Monocypher by Loup Vaillant and contributors,
+dual-licensed BSD-2-Clause / CC0-1.0 (see its
+[LICENCE.md](third_party/monocypher/LICENCE.md)); both are compatible with the GPL.
