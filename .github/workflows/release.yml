@@ -61,8 +61,15 @@ jobs:
           if (-not $iscc) { choco install innosetup --no-progress -y }
 
       - name: Configure
-        # The -D argument stays quoted: PowerShell otherwise cuts "...=0.2.0" down to "0".
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DNETMOUSE_VERSION=${{ steps.ver.outputs.version }}"
+        shell: pwsh
+        # The generator comes from the image (see build.yml), and the -D argument stays quoted:
+        # PowerShell otherwise cuts "...=0.2.0" down to "0".
+        run: |
+          $m = cmake --help | Select-String -Pattern '^\*\s+(Visual Studio \d+ \d+)'
+          if (-not $m) { throw "No Visual Studio generator available on this image" }
+          $generator = $m.Matches[0].Groups[1].Value
+          "Generator: $generator"
+          cmake -S . -B build -G "$generator" -A x64 "-DNETMOUSE_VERSION=${{ steps.ver.outputs.version }}"
 
       - name: Build
         run: cmake --build build --config Release

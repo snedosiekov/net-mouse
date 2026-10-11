@@ -28,8 +28,24 @@ jobs:
             "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
           if (-not $iscc) { choco install innosetup --no-progress -y }
 
+      - name: Toolchain
+        shell: pwsh
+        run: |
+          cmake --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) { & $vswhere -latest -products * -property displayName, installationVersion }
+          cmake --help | Select-String 'Visual Studio'
+
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        shell: pwsh
+        # The runner image decides which Visual Studio is installed, so take the generator CMake
+        # itself defaults to (marked with * in its help) instead of naming a year that may be gone.
+        run: |
+          $m = cmake --help | Select-String -Pattern '^\*\s+(Visual Studio \d+ \d+)'
+          if (-not $m) { throw "No Visual Studio generator available on this image" }
+          $generator = $m.Matches[0].Groups[1].Value
+          "Generator: $generator"
+          cmake -S . -B build -G "$generator" -A x64
 
       - name: Build
         run: cmake --build build --config Release
