@@ -5,7 +5,7 @@ Use the mouse and keyboard of one PC (the **master**) to control that PC and any
 way as in the Windows display settings. When the pointer leaves the master's monitors through an edge that
 touches a slave screen, it continues on that slave, and the keyboard follows it.
 
-![One mouse and keyboard; the pointer crosses from the master's screen onto the other PCs](docs/images/overview.svg)
+![A developer at a desk: a notebook on the left, a nettop with its monitor on the right, one keyboard and one mouse for both](docs/images/desk.svg)
 
 It is a software KVM for input only: no video, no files, nothing installed on the PCs but Net Mouse
 itself. Each PC keeps its own screens, applications and clipboard; only the pointer and the keystrokes
@@ -168,6 +168,11 @@ The settings are in `%ProgramData%\NetMouse\netmouse.ini`. This PC's private key
 next to it; it never leaves the PC. Logs: `netmouse-agent.log` and `netmouse-service.log` in the same folder.
 
 ## How it works
+
+![One mouse and keyboard; the pointer crosses from the master's screen onto the other PCs](docs/images/overview.svg)
+
+Every PC runs the same program in one of two roles. The master owns the pointer and decides where it
+is; a slave only receives it and plays it back on its own screens.
 
 ![The service starts an agent in the signed-in session; the agents talk over encrypted UDP](docs/images/architecture.svg)
 

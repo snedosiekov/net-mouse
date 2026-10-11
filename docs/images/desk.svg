@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 600" width="960" height="600" role="img"
+     aria-label="A developer at a desk with a notebook on the left and a nettop with a monitor on the right, using one keyboard and one mouse for both">
+  <defs>
+    <linearGradient id="dblue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B97EE"/><stop offset="1" stop-color="#2654A8"/>
+    </linearGradient>
+    <linearGradient id="dgreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4CCB92"/><stop offset="1" stop-color="#1A7C54"/>
+    </linearGradient>
+    <linearGradient id="dgloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <marker id="dtip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#FF8C00"/>
+    </marker>
+  </defs>
+
+  <rect width="960" height="600" fill="#ffffff"/>
+  <ellipse cx="480" cy="300" rx="408" ry="238" fill="#EFF4FC"/>
+
+  <!-- chair -->
+  <rect x="402" y="262" width="156" height="180" rx="30" fill="#C6D0E0"/>
+
+  <!-- the developer, behind the desk -->
+  <g>
+    <rect x="418" y="286" width="124" height="156" rx="30" fill="#55617A"/>
+    <rect x="468" y="262" width="24" height="30" rx="10" fill="#D9A281"/>
+    <circle cx="480" cy="234" r="37" fill="#E3AF8C"/>
+    <path d="M443,228 a37,37 0 0 1 74,0 q-12,-13 -37,-11 q-25,2 -37,11 z" fill="#3A3F4B"/>
+    <g stroke="#3A3F4B" stroke-width="2.2" fill="none">
+      <circle cx="468" cy="236" r="10.5"/>
+      <circle cx="494" cy="236" r="10.5"/>
+      <path d="M478.5,236 h5"/>
+      <path d="M457.5,234 l-9,-3"/>
+      <path d="M504.5,234 l9,-3"/>
+    </g>
+    <circle cx="468" cy="237" r="2.6" fill="#3A3F4B"/>
+    <circle cx="494" cy="237" r="2.6" fill="#3A3F4B"/>
+    <path d="M471,253 q9,7 18,0" stroke="#B9815E" stroke-width="2" fill="none" stroke-linecap="round"/>
+    <path d="M452,292 q28,10 56,0" stroke="#48526A" stroke-width="2.4" fill="none"/>
+  </g>
+
+  <!-- desk -->
+  <rect x="40" y="428" width="880" height="22" rx="7" fill="#D9BC9C"/>
+  <rect x="40" y="444" width="880" height="8" rx="4" fill="#C2A183"/>
+  <rect x="92" y="452" width="20" height="94" rx="5" fill="#C2A183"/>
+  <rect x="848" y="452" width="20" height="94" rx="5" fill="#C2A183"/>
+
+  <!-- notebook (master) -->
+  <g>
+    <rect x="120" y="252" width="220" height="150" rx="10" fill="#22262E"/>
+    <rect x="128" y="260" width="204" height="134" rx="6" fill="url(#dblue)"/>
+    <rect x="128" y="260" width="204" height="60" rx="6" fill="url(#dgloss)"/>
+    <text x="230" y="318" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+          font-size="19" font-weight="600" fill="#ffffff">MASTER</text>
+    <text x="230" y="342" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+          font-size="12.5" fill="#E6EEFB">your main PC</text>
+    <path d="M110,402 L350,402 L366,428 L94,428 Z" fill="#39414F"/>
+    <rect x="196" y="410" width="68" height="12" rx="3" fill="#4B5566"/>
+  </g>
+
+  <!-- monitor (slave) -->
+  <g>
+    <rect x="600" y="232" width="262" height="162" rx="11" fill="#22262E"/>
+    <rect x="608" y="240" width="246" height="146" rx="7" fill="url(#dgreen)"/>
+    <rect x="608" y="240" width="246" height="64" rx="7" fill="url(#dgloss)"/>
+    <text x="731" y="302" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+          font-size="19" font-weight="600" fill="#ffffff">SLAVE</text>
+    <text x="731" y="326" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+          font-size="12.5" fill="#DFF3E9">the nettop's screen</text>
+    <rect x="718" y="394" width="26" height="22" fill="#22262E"/>
+    <rect x="684" y="414" width="94" height="13" rx="6" fill="#22262E"/>
+  </g>
+
+  <!-- nettop: a small box standing on the desk next to the monitor -->
+  <g>
+    <rect x="806" y="378" width="48" height="50" rx="7" fill="#2F3542"/>
+    <rect x="812" y="384" width="36" height="38" rx="5" fill="#3B4252"/>
+    <circle cx="819" cy="391" r="3.2" fill="#4CCB92"/>
+    <g stroke="#59627A" stroke-width="2" stroke-linecap="round">
+      <path d="M816,402 h28"/><path d="M816,410 h28"/><path d="M816,418 h28"/>
+    </g>
+    <path d="M806,400 C790,400 784,410 781,419" stroke="#8E99AD" stroke-width="2.4" fill="none"/>
+  </g>
+
+  <!-- the one keyboard and the one mouse, cabled to the notebook -->
+  <path d="M580,418 C540,434 460,434 404,420 C384,414 372,418 366,422" stroke="#A9B3C4" stroke-width="2.4"
+        fill="none" stroke-linecap="round"/>
+  <path d="M398,408 C388,406 376,410 366,418" stroke="#A9B3C4" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+  <g>
+    <rect x="398" y="396" width="164" height="32" rx="6" fill="#EDF0F5" stroke="#C3CBD8"/>
+    <g fill="#B9C2D0">
+      <rect x="406" y="403" width="13" height="8" rx="2"/><rect x="423" y="403" width="13" height="8" rx="2"/>
+      <rect x="440" y="403" width="13" height="8" rx="2"/><rect x="457" y="403" width="13" height="8" rx="2"/>
+      <rect x="474" y="403" width="13" height="8" rx="2"/><rect x="491" y="403" width="13" height="8" rx="2"/>
+      <rect x="508" y="403" width="13" height="8" rx="2"/><rect x="525" y="403" width="29" height="8" rx="2"/>
+      <rect x="406" y="415" width="18" height="8" rx="2"/><rect x="428" y="415" width="13" height="8" rx="2"/>
+      <rect x="445" y="415" width="13" height="8" rx="2"/><rect x="462" y="415" width="60" height="8" rx="2"/>
+      <rect x="526" y="415" width="13" height="8" rx="2"/><rect x="543" y="415" width="11" height="8" rx="2"/>
+    </g>
+  </g>
+  <g>
+    <path d="M594,392 a16,16 0 0 1 16,16 v12 a16,16 0 0 1 -32,0 v-12 a16,16 0 0 1 16,-16 z"
+          fill="#EDF0F5" stroke="#C3CBD8"/>
+    <path d="M594,392 v13" stroke="#C3CBD8" fill="none"/>
+  </g>
+
+  <!-- mug -->
+  <g>
+    <rect x="352" y="398" width="34" height="30" rx="5" fill="#E2E7EF" stroke="#C3CBD8"/>
+    <path d="M386,406 a9,9 0 0 1 0,14" fill="none" stroke="#C3CBD8" stroke-width="3"/>
+    <path d="M362,392 q5,-8 0,-14 M374,392 q5,-8 0,-14" stroke="#C7D0DE" stroke-width="2.4" fill="none"
+          stroke-linecap="round"/>
+  </g>
+
+  <!-- arms and hands, resting on the keyboard and the mouse -->
+  <g stroke="#55617A" stroke-width="23" stroke-linecap="round" fill="none">
+    <path d="M432,306 C410,348 420,382 442,396"/>
+    <path d="M530,306 C562,336 580,362 590,384"/>
+  </g>
+  <circle cx="444" cy="398" r="13" fill="#E3AF8C"/>
+  <circle cx="592" cy="389" r="13" fill="#E3AF8C"/>
+
+  <!-- the pointer crossing from the notebook's screen to the monitor -->
+  <path d="M322,292 C398,100 562,98 612,286" fill="none" stroke="#FF8C00" stroke-width="3"
+        stroke-dasharray="8 7" marker-end="url(#dtip)"/>
+  <g transform="translate(296 282) scale(1.3)" fill="#ffffff" stroke="#22262E" stroke-width="1.2">
+    <path d="M0,0 L0,15 L4,11.5 L6.5,17 L9,15.8 L6.5,10.6 L11,10.4 Z"/>
+  </g>
+  <g transform="translate(620 290) scale(1.3)" fill="#ffffff" stroke="#22262E" stroke-width="1.2">
+    <path d="M0,0 L0,15 L4,11.5 L6.5,17 L9,15.8 L6.5,10.6 L11,10.4 Z"/>
+  </g>
+  <text x="467" y="112" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+        font-size="14.5" font-weight="600" fill="#B35A00">the pointer simply keeps going</text>
+
+  <!-- labels -->
+  <text x="230" y="492" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+        font-size="14" font-weight="600" fill="#2E3542">notebook — MASTER</text>
+  <text x="230" y="514" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+        font-size="12.5" fill="#5A6472">the keyboard and mouse are plugged in here</text>
+  <text x="731" y="492" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+        font-size="14" font-weight="600" fill="#2E3542">nettop + monitor — SLAVE</text>
+  <text x="731" y="514" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+        font-size="12.5" fill="#5A6472">no keyboard or mouse of its own</text>
+
+  <text x="480" y="564" text-anchor="middle" font-family="Segoe UI, Inter, system-ui, sans-serif"
+        font-size="14.5" fill="#5A6472">One keyboard and one mouse for both PCs — they are shared over the local network, not switched.</text>
+</svg>
